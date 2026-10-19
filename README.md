@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.3-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.4-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -493,6 +493,16 @@ python _verify_models.py --base http://127.0.0.1:8790
 ## 七、版本与更新日志 (Changelog)
 
 完整说明见 [Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
+
+### v1.5.4
+
+**🐛 问题修复**
+
+- **信封层排队（10605 / RESOURCE_LIMIT）没有等待**（#51 后续）：上游会先以 HTTP 200 建流、再在 SSE 信封里投递 `403 {isQueued:true, retryAfterSeconds:30, subCode:RESOURCE_LIMIT}`。v1.5.3 之前只在 **HTTP 层**做了排队等待，信封层仍按普通 403 冷却换号，换不到就把 403 直接丢给客户端（表现为 `request error: status=403 … 10605`）。
+  现在信封层同样识别排队：`should_retry_envelope` 对排队信号允许比瞬时重试更多轮（最多 `QUEUE_MAX_ROUNDS`），重开前按 `retryAfterSeconds+1` 等待；非流式聚合循环也留出了排队轮次；普通 403 的重试轮次**不变**。
+- **排队失败给可读文案**：10605 / RESOURCE_LIMIT 不再是一段嵌套 JSON，而是「上游排队中…已按 retryAfterSeconds 等待并重试，仍拿不到可用资源，请稍后重试」。
+
+**验证**：全量 **38 suites / 1353 checks / 0 failed**（新增 8 条：嵌套 detail 解析、信封排队识别、重试轮次、等待时长、普通 403 不变、已吐字节不重开、文案映射、聚合轮次）。
 
 ### v1.5.3
 

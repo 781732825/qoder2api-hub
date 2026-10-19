@@ -112,4 +112,33 @@ except Exception as exc:
     _ok = False
 check("#50 --help 里能看到 --pid-file", _ok)
 
+# ---------------------------------------------------------------- #51 补充
+print("[51b] 信封层排队（10605 / RESOURCE_LIMIT）")
+_DETAIL = json.dumps({"code": "403", "message": json.dumps({
+    "code": "10605", "message": json.dumps({
+        "isQueued": True, "retryAfterSeconds": 30,
+        "serviceAvailable": False, "subCode": "RESOURCE_LIMIT"}),
+    "subCode": "RESOURCE_LIMIT"})})
+_exc = P.UpstreamStatus(403, _DETAIL)
+check("#51b 嵌套 detail 里的 retryAfterSeconds 能解析出来",
+      P._queue_wait_seconds(_DETAIL) == 30, P._queue_wait_seconds(_DETAIL))
+check("#51b 信封层识别排队信号", P._envelope_queue_wait(_exc) == 30)
+check("#51b 排队时允许多等几轮（attempt 0/1/2 可重试，3 停止）",
+      [P.should_retry_envelope(_exc, 0, a) for a in range(4)]
+      == [True, True, True, False])
+check("#51b 重开前按 retryAfterSeconds 等待（30+1=31s）",
+      P._envelope_retry_wait(_exc, 1) == 31, P._envelope_retry_wait(_exc, 1))
+check("#51b 已向客户端吐过字节就不再重开",
+      P.should_retry_envelope(_exc, 10, 0) is False)
+_plain = P.UpstreamStatus(403, "forbidden")
+check("#51b 普通 403 的重试轮次不变（不因排队逻辑放宽）",
+      [P.should_retry_envelope(_plain, 0, a) for a in range(3)]
+      == [True, True, False])
+_msg, _type = P.friendly_upstream_error(403, _DETAIL)
+check("#51b 排队错误给可读文案（含 10605/RESOURCE_LIMIT 与稍后重试）",
+      _type == "upstream_queued" and "排队" in _msg, (_type, _msg[:40]))
+_src51 = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
+check("#51b 非流式聚合也留出排队轮次",
+      "TRANSIENT_MAX_RETRIES + 1 + QUEUE_MAX_ROUNDS" in _src51)
+
 finish()

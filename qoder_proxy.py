@@ -56,7 +56,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.3"
+VERSION = "1.5.4"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5079,6 +5079,11 @@ def friendly_upstream_error(code, detail):
         code_i = int(code)
     except Exception:
         code_i = 502
+    # issue #38/#51：上游排队 / 资源不足（10605 RESOURCE_LIMIT）
+    if "10605" in detail or "isQueued" in detail or "RESOURCE_LIMIT" in detail:
+        return ("上游排队中（10605 / RESOURCE_LIMIT）：已按 retryAfterSeconds 等待并重试，"
+                "仍拿不到可用资源。请稍后重试；若频繁出现，说明该模型当前排队严重。"
+                "上游详情：%s" % (detail[:200] or "(无详情)"), "upstream_queued")
     # 0) issue #37：工具参数非法（确定性、可重试但不是账号问题）
     if "invalid JSON arguments" in detail:
         return ("上游生成的工具调用参数不是合法 JSON，本轮**未执行任何工具**；"
@@ -5168,6 +5173,26 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         if total > 1 and not any(m in detail for m in _CLIENT_FAULT_MARKERS):
             account.note_unknown_failure("envelope HTTP %s" % status_int)
 
+def _envelope_queue_wait(exc):
+    """信封层排队信号 -> 建议等待秒数（issue #38 后续 / #51 补充）。
+
+    上游有时先以 HTTP 200 建流，再把「排队」作为 SSE 信封投递：
+      status=403 detail={"code":"10605","message":"{...isQueued:true...}",
+                         "retryAfterSeconds":30,...}
+    此前只在 **HTTP 层**做了等待，信封层仍按普通 403 处理：冷却账号 + 换号，
+    换不到就直接把 403 丢给客户端（报告者看到的 request error）。
+    """
+    return _queue_wait_seconds(getattr(exc, "detail", "") or "")
+
+
+def _envelope_retry_wait(exc, attempt):
+    """重开上游前的等待秒数：排队按 retryAfterSeconds，其它按次数退避。"""
+    q = _envelope_queue_wait(exc)
+    if q > 0:
+        return min(q + 1, QUEUE_WAIT_MAX_SECS)
+    return attempt
+
+
 def should_retry_envelope(exc, emitted_bytes, attempt):
     # issue #37：坏参数是**模型内容问题**，不是瞬时上游故障——绝不自动重发
     # （否则会重复计费，且下一次很可能同样非法）。客户端想重试由它自己决定。
@@ -5182,6 +5207,11 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
         return False
     if emitted_bytes:
         return False
+    _q = _envelope_queue_wait(exc)
+    if _q > 0:
+        # queue: wait per retryAfterSeconds, allow more rounds than transient
+        return (_q <= QUEUE_WAIT_MAX_SECS
+                and attempt < max(QUEUE_MAX_ROUNDS, TRANSIENT_MAX_RETRIES))
     if attempt >= TRANSIENT_MAX_RETRIES:
         return False
     status_int = _to_int_status(getattr(exc, "status", 502))
@@ -5205,7 +5235,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
     """
     cur = resp
     try:
-        for attempt in range(TRANSIENT_MAX_RETRIES + 1):
+        # issue #51 补充：排队可能要多等几轮（仅排队时 should_retry 才允许）
+        for attempt in range(TRANSIENT_MAX_RETRIES + 1 + QUEUE_MAX_ROUNDS):
             try:
                 obj = aggregate_stream(cur, model, None, holder=holder,
                                        allowed_names=_tool_names_from_payload(payload))
@@ -5218,7 +5249,7 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                     "(try %d/%d), reopening upstream"
                     % (exc.status, model, attempt + 1,
                        TRANSIENT_MAX_RETRIES + 1), level="WARN", tag="chat")
-                time.sleep(attempt + 1)
+                time.sleep(_envelope_retry_wait(exc, attempt + 1))
                 try:
                     new_resp, account, _ = open_upstream(
                         payload, session_key=session_key, target_realm=realm)
@@ -8362,7 +8393,7 @@ class Handler(BaseHTTPRequestHandler):
                                     % (exc.status, attempts + 1,
                                        TRANSIENT_MAX_RETRIES + 1),
                                     level="WARN", tag="chat")
-                                time.sleep(attempts)
+                                time.sleep(_envelope_retry_wait(exc, attempts))
                                 try:
                                     # 必须用转换后的 chat 请求体重开：原始
                                     # Responses 体的会话在 input 字段里，而
@@ -8630,7 +8661,7 @@ class Handler(BaseHTTPRequestHandler):
                                     % (exc.status, model, attempts + 1,
                                        TRANSIENT_MAX_RETRIES + 1),
                                     level="WARN", tag="chat")
-                                time.sleep(attempts)
+                                time.sleep(_envelope_retry_wait(exc, attempts))
                                 try:
                                     cur2, account, _ = open_upstream(
                                         payload, session_key=session_key,
