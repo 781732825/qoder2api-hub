@@ -26,6 +26,7 @@ OpenAI 兼容接口。上游链路：
     python qoder_proxy.py --api-key sk-local  # require a bearer token
 """
 import argparse
+import atexit
 import hashlib
 from collections import deque
 import re
@@ -55,7 +56,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.2"
+VERSION = "1.5.3"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3189,8 +3190,13 @@ def parse_dsml_tool_calls(text):
         return None, text
     match = DSML_CALLS_RE.search(text)
     if not match:
-        return None, text
-    calls_block = match.group(1)
+        # issue #51：截图里出现过「没有 calls 包裹、只有 invoke/parameter」的形态
+        # （以及 calls 闭合标签被截断）——直接在全文里找 invoke 块。
+        if not DSML_INVOKE_RE.search(text):
+            return None, text
+        calls_block = text
+    else:
+        calls_block = match.group(1)
     tool_calls = []
     for inv_match in DSML_INVOKE_RE.finditer(calls_block):
         func_name = inv_match.group(1)
@@ -3205,7 +3211,15 @@ def parse_dsml_tool_calls(text):
             "name": func_name,
             "arguments": json.dumps(params, ensure_ascii=False),
         })
-    clean = (text[:match.start()].strip() + " " + text[match.end():].strip()).strip()
+    if match is not None:
+        clean = (text[:match.start()].strip() + " "
+                 + text[match.end():].strip()).strip()
+    else:
+        # 无 calls 包裹（issue #51）：从第一个 invoke 之前的标签起点裁起
+        _starts = [m.start() for m in DSML_INVOKE_RE.finditer(text)]
+        _start = min(_starts) if _starts else 0
+        _lt = text.rfind("<", 0, _start)
+        clean = text[:(_lt if _lt >= 0 else _start)].strip()
     return tool_calls, clean
 
 
@@ -3490,9 +3504,17 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     # issue #49：模型在长会话里会写成「散文 + marker + marker + 数组 + DSML 尾」。
     # 取**最后一个** marker 起算（前面散文作为 clean 返回，由调用方补发），
     # 再剥掉连续重复的 marker 与尾部围栏——这些都不放松后面的严格校验。
+    # issue #51：截图里出现「闭标签 + 数组」（无 marker）与「marker + 杂字 + 数组」。
+    # 先剥掉前导的 DSML 闭合标签，再决定起点。
+    t = re.sub(r"^(?:\s*</[^>]*DSML[^>]*>)+", "", t).strip()
     _mpos = t.rfind(LEAK_MARKER)
     if _mpos < 0:
-        return None, text
+        # 无 marker：允许「整段就是 [{name, arguments}] 数组」（严格校验仍在下面）
+        if t.startswith("["):
+            _mpos = 0
+            t = LEAK_MARKER + chr(10) + t     # 复用同一套解析路径
+        else:
+            return None, text
     prefix = t[:_mpos]
     # 前缀尾部可能残留 marker（「散文 + marker1 + marker2 + 数组」时，
     # marker1 落在 prefix 里）——它绝不能当正文发给客户端。
@@ -3508,7 +3530,19 @@ def parse_leaked_tool_calls(text, allowed_names=None):
         t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
     rest = t.strip()
     if not (rest.startswith("[") and rest.endswith("]")):
-        return None, text
+        # issue #51 形态C：marker 后跟杂字（如 ">）、且数组的开头 [ 丢了。
+        # 取第一个 { 到最后一个 } 重新包成数组——后续严格校验不变。
+        _i = rest.find("{")
+        _j = rest.rfind("}")
+        if (not rest.startswith("[")) and 0 <= _i < _j:
+            _cand = "[" + rest[_i:_j + 1] + "]"
+            try:
+                json.loads(_cand)
+                rest = _cand
+            except Exception:
+                return None, text
+        else:
+            return None, text
     try:
         arr = json.loads(rest)
     except Exception:
@@ -3716,6 +3750,16 @@ def _still_leak_candidate(text):
     rest = (body or "").lstrip()
     if not rest:
         return True
+    # issue #51：marker 之后可能先跟一小段杂字（">、=、: 等）再进数组，
+    # 且数组开头的 [ 可能丢了（直接 {"name":...}）。两种都保持候选，
+    # 由流末 parse（含补括号启发式）决定成败。
+    _trimmed = rest.lstrip(chr(34) + chr(39) + ">=: ").lstrip()
+    if not _trimmed:
+        return True          # 目前全是杂字（还没进数组）：继续等
+    if _trimmed[0] in "[{":
+        rest = _trimmed
+        if rest.startswith("{"):
+            return True
     if rest.endswith("```"):
         rest = rest[:-3]
     return _json_array_prefix_ok(rest)
@@ -4143,13 +4187,144 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
         yield _leak_chunk_frame(meta, {}, "tool_calls")
 
 
+def _dsml_tail_hold(text):
+    """返回「疑似 DSML 标签开头」的尾巴（跨帧暂留用，issue #51）。"""
+    t = text or ""
+    i = t.rfind("<")
+    if i < 0 or len(t) - i > 24:
+        return ""
+    tail = t[i:]
+    if ">" in tail:               # 已经是完整标签：不算前缀，别暂留
+        return ""
+    norm = tail.replace(chr(0xFF5C), "|").upper()
+    body = norm[1:]
+    if body.startswith("/"):          # 闭标签 </... 也要暂留
+        body = body[1:]
+    if not body:
+        return tail                   # "<" / "</"
+    if not body.startswith("|"):
+        return ""
+    rest = body[1:]
+    if not rest:
+        return tail
+    if "DSML".startswith(rest) or rest.startswith("DSML"):
+        return tail
+    return ""
+
+
+def _sse_recover_dsml(frames, allowed_names=None):
+    """把流式正文里的 DeepSeek DSML 工具调用还原成结构化 tool_calls（issue #51）。
+
+    chat / Anthropic 两条流式路径此前**完全没有** DSML 回读（只有 Responses 有），
+    模型直接吐原生 DSML 时整段协议漏成正文。
+    策略：平时只暂留「像标签开头」的几个字符；一旦正文出现 DSML 就转入缓冲
+    直到流末统一解析——解析出调用则补发散文 + tool_calls + finish=tool_calls；
+    解析不出则原样补发（fail-open）并记 WARN。非 DSML 流逐字节不变。
+    """
+    buf = ""
+    tail = ""
+    finish = None
+    meta = {"id": None, "model": None, "created": None}
+    recovered = False
+
+    for raw in frames:
+        text = (raw.decode("utf-8", "replace")
+                if isinstance(raw, bytes) else raw)
+        data = strip_data_prefix(text)
+        if not data or data == "[DONE]":
+            continue
+        try:
+            payload = json.loads(data)
+        except Exception:
+            yield raw
+            continue
+        choices = payload.get("choices") if isinstance(payload, dict) else None
+        if not isinstance(choices, list) or not choices:
+            yield raw
+            continue
+        if not meta["id"] and payload.get("id"):
+            meta["id"] = payload.get("id")
+        if not meta["model"] and payload.get("model"):
+            meta["model"] = payload.get("model")
+        if not meta["created"] and payload.get("created"):
+            meta["created"] = payload.get("created")
+        ch = choices[0] if isinstance(choices[0], dict) else {}
+        delta = ch.get("delta") or {}
+        piece = delta.get("content")
+        fin = ch.get("finish_reason")
+        if not isinstance(piece, str) or not piece:
+            if fin:
+                finish = (payload, fin)
+            else:
+                yield raw
+            continue
+        piece = tail + piece
+        tail = ""
+        if not buf:
+            hold = _dsml_tail_hold(piece)
+            body = piece[:len(piece) - len(hold)] if hold else piece
+            if "DSML" in body:
+                buf = body
+                tail = hold
+                continue
+            if body:
+                payload2 = json.loads(json.dumps(payload))
+                payload2["choices"][0].setdefault("delta", {})["content"] = body
+                yield ("data: " + json.dumps(payload2, ensure_ascii=False)
+                       + "\n\n").encode("utf-8")
+            tail = hold
+            continue
+        buf += piece
+
+    if buf:
+        calls, clean = parse_dsml_tool_calls(buf)
+        if not calls:
+            # issue #51：闭标签 + 数组 / marker + 杂字 + 数组 也走同一条恢复链
+            _lc, _lclean = parse_leaked_tool_calls(buf, allowed_names)
+            if _lc:
+                calls = [{"id": c.get("id"), "name": (c.get("function") or {}).get("name"),
+                          "arguments": (c.get("function") or {}).get("arguments")}
+                         for c in _lc]
+                clean = _lclean
+        if calls:
+            recovered = True
+            if clean:
+                yield _leak_chunk_frame(meta, {"content": clean})
+            for i, call in enumerate(calls):
+                yield _leak_chunk_frame(meta, {"tool_calls": [{
+                    "index": i,
+                    "id": call.get("id") or _new_id("call_"),
+                    "type": "function",
+                    "function": {"name": call.get("name") or "",
+                                 "arguments": call.get("arguments") or "{}"},
+                }]})
+        else:
+            _log_unrecovered_leak(buf, "dsml-stream")
+            yield _leak_chunk_frame(meta, {"content": buf})
+    if tail:
+        yield _leak_chunk_frame(meta, {"content": tail})
+    if finish is not None:
+        payload, fin = finish
+        if recovered:
+            payload = json.loads(json.dumps(payload))
+            for ch2 in payload.get("choices") or []:
+                if isinstance(ch2, dict) and ch2.get("finish_reason"):
+                    ch2["finish_reason"] = "tool_calls"
+        yield ("data: " + json.dumps(payload, ensure_ascii=False)
+               + "\n\n").encode("utf-8")
+    elif recovered:
+        yield _leak_chunk_frame(meta, {}, "tool_calls")
+
+
 def recover_leaked_tool_calls(frames, allowed_names=None):
     """流式出口：回读（issue #8）+ **tool_call id 保证**（issue #47）。
 
     保持同名：三条调用点（chat 主链路 / Anthropic / Responses）都不用改。
     """
     for frame in _sse_fill_tool_call_ids(
-            _recover_leaked_tool_calls_inner(frames, allowed_names)):
+            _sse_recover_dsml(
+                _recover_leaked_tool_calls_inner(frames, allowed_names),
+                allowed_names)):
         yield frame
 
 
@@ -4866,6 +5041,32 @@ def _is_transient_transport(exc):
         return any(k in low for k in ("ssl", "eof", "reset", "timed out",
                                       "broken pipe", "connection"))
     return False
+
+
+def _friendly_net_error(exc, target=""):
+    """把 urlopen/连接类异常翻成可操作的中文（issue #52）。
+
+    报告者点「测试」只看到 `<urlopen error [WinError 10061] 由于目标计算机积极拒绝
+    无法连接。>`——这是**本机连不上某个地址**，不是上游业务错误。最常见三种原因：
+    ① 服务没起/端口不对；② 环境变量代理指向一个已经关掉的本地代理（#27 只认 env）；
+    ③ 域名/端口写错。这里把它们直接写进错误里。
+    """
+    s = str(exc or "")
+    low = s.lower()
+    tgt = target or "目标地址"
+    if ("10061" in s or "connection refused" in low
+            or "actively refused" in low or "积极拒绝" in s):
+        return ("连接被拒绝（WinError 10061）：%s 没有在监听。请检查 ①服务是否已启动、"
+                "端口是否一致 ②环境变量 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY 指向的"
+                "代理是否还在运行（网关只认环境变量，不读系统代理）③地址/域名是否"
+                "写错。原始错误：%s" % (tgt, s[:180]))
+    if "10060" in s or "timed out" in low or "超时" in s:
+        return ("连接超时：%s 不可达（网络/代理/防火墙）。原始错误：%s"
+                % (tgt, s[:180]))
+    if "10054" in s or "reset" in low or "远程主机强迫关闭" in s:
+        return ("连接被重置：%s 主动断开（常见于代理拦截或 TLS 握手被打断）。"
+                "原始错误：%s" % (tgt, s[:180]))
+    return s[:300]
 
 
 def friendly_upstream_error(code, detail):
@@ -5672,6 +5873,22 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
             else:
                 # issue #49 方向 C：四条路径都没认出来 -> 至少留痕（非流式侧）
                 _log_unrecovered_leak(_echo_src, "aggregate")
+    # issue #51：DeepSeek DSML 回退（非流式 chat 侧此前**完全没有**这一层，
+    # 只有 Responses 有）——模型直接吐原生 DSML 时整段协议会当正文返回。
+    if not tool_calls_map and "DSML" in (message.get("content") or ""):
+        _dsml_calls, _dsml_clean = parse_dsml_tool_calls(message["content"])
+        if _dsml_calls:
+            tool_calls_map = {
+                i: {"id": c.get("id") or _new_id("call_"),
+                    "type": "function",
+                    "function": {"name": c.get("name") or "",
+                                 "arguments": c.get("arguments") or "{}"}}
+                for i, c in enumerate(_dsml_calls)}
+            message["content"] = _dsml_clean or ""
+            if finish in ("stop", None):
+                finish = "tool_calls"
+        else:
+            _log_unrecovered_leak(message["content"], "aggregate-dsml")
     # 二次防御：剔除「无函数名」的空 tool_call，防止客户端死等
     if tool_calls_map:
         tool_calls_map = {k: v for k, v in tool_calls_map.items()
@@ -7812,9 +8029,13 @@ class Handler(BaseHTTPRequestHandler):
                 log("account test: uid=%s model=%s wall=%dms exc=%s"
                     % (account.uid[:8], test_model, wall_ms, exc),
                     level="WARN", tag="accounts")
-                return self._json(200, {"ok": False, "uid": account.uid,
-                                        "status": 500, "error": str(exc),
-                                        "elapsed_ms": wall_ms})
+                return self._json(200, {
+                    "ok": False, "uid": account.uid, "status": 500,
+                    "error": _friendly_net_error(
+                        exc,
+                        qoder_accounts.get_realm_config(
+                            acc_realm(account))["gateway"]),
+                    "elapsed_ms": wall_ms})
         if path == "/accounts/set":
             uid = payload.get("uid")
             if not uid:
@@ -8540,7 +8761,28 @@ def main():
     ap.add_argument("--panel-password", default=None,
                     help="set the web panel password on startup (default: "
                          "admin)")
+    ap.add_argument("--pid-file", default=None,
+                    help="write the server PID to this file (stop.bat uses it; "
+                         "removed on exit)")
     args = ap.parse_args()
+
+    # issue #50：把 PID 落盘，交给 stop.bat 精确停止（只认这个 PID + 命令行
+    # 校验，绝不做「杀掉所有 python」那种模糊匹配）。
+    if args.pid_file:
+        try:
+            with open(args.pid_file, "w", encoding="utf-8") as _pf:
+                _pf.write(str(os.getpid()))
+
+            def _drop_pid_file(path=args.pid_file):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+
+            atexit.register(_drop_pid_file)
+        except Exception as _exc:
+            log("pid file write failed (%s): %s" % (args.pid_file, _exc),
+                level="WARN")
 
     if args.lan and args.host == "127.0.0.1":
         args.host = "0.0.0.0"
