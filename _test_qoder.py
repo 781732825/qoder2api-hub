@@ -265,8 +265,12 @@ check("model_entry upstream_key kept", me["upstream_key"] == "qmodel_38max")
 check("model_entry aliases cover key + bracket form + friendly alias",
       "qmodel_38max" in me["aliases"] and "qmodel_38max (Qwen3.8-Max)" in me["aliases"]
       and "qwen3.8-max" in me["aliases"], me.get("aliases"))
+# issue #68：文案会随官方文档更新（当前 qmodel_38max 是「Qwen 最新基座模型…」）。
+# 断言不再硬编码某个词，而是比对**文案源**本身，避免每次改文案都要动测试。
 check("model_entry description = official desktop copy",
-      "千问" in (me.get("description") or ""), (me.get("description") or "")[:60])
+      bool(me.get("description"))
+      and me.get("description") == C.official_description("qmodel_38max"),
+      (me.get("description") or "")[:60])
 check("model_entry enabled flag", me["enabled"] is True)
 check("model_entry peak/valley factors",
       me["price_factor_peak"] == 0.5 and me["price_factor_valley"] == 0.2)
