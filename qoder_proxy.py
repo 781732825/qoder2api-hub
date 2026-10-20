@@ -57,7 +57,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.10"
+VERSION = "1.5.11"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3305,6 +3305,42 @@ LEAK_MARKER = "[assistant 请求调用工具]"
 # with ANGLE brackets (<assistant 请求调用工具>). Normalize it to the square-bracket
 # form at every entry so there is exactly one code path for detection.
 LEAK_MARKER_ALT = "<assistant 请求调用工具>"
+# issue #60 follow-up：模型复述时还会把括号写成 `[<assistant 请求调用工具]`、
+# 或丢掉尾括号 `[<assistant 请求调用工具`。这里用一条正则统一识别所有变体，
+# 避免每出现一种就补一个常量。
+_LEAK_MARKER_RE = re.compile(
+    r"[\[<(]*\s*assistant\s*请求调用工具\s*[\]>)]?")
+
+_MARKER_CORE = "assistant请求调用工具"
+# 只匹配「开头」部分（前导括号 + assistant + 文案），不含尾括号。
+_MARKER_OPEN_RE = re.compile(r"^[\[<(]*\s*assistant\s*请求调用工具")
+_MARKER_OPEN_CANON = "[assistant 请求调用工具"
+
+
+def _marker_key(text):
+    """去掉空白后的 marker 主体（用于前缀判定）。"""
+    return (text or "").replace(" ", "").replace("\u3000", "")
+
+
+def _marker_prefix_ok(text):
+    """text 是否是某个 marker 变体的**前半截**（跨帧/截断用）。"""
+    raw = (text or "").lstrip()
+    body = raw.lstrip("[<")
+    key = _marker_key(body)
+    if not key:
+        return raw.strip() in ("", "[", "<", "[<")
+    return _MARKER_CORE.startswith(key)
+
+
+def _last_marker_span(text):
+    """返回最后一个 marker 变体的 (start, end)；没有则 (-1, -1)。"""
+    last = (-1, -1)
+    for m in _LEAK_MARKER_RE.finditer(text or ""):
+        last = (m.start(), m.end())
+    return last
+
+
+
 
 
 def _normalize_leak_marker(text):
@@ -3318,8 +3354,14 @@ def _normalize_leak_marker(text):
         return text
     t = text.lstrip()
     lead = text[:len(text) - len(t)]
-    if t.startswith(LEAK_MARKER_ALT):
-        return lead + LEAK_MARKER + t[len(LEAK_MARKER_ALT):]
+    # issue #60 follow-up：只把**开头**归一成规范形态，尾括号（或缺失）
+    # 原样保留——否则给本来没写 ] 的片段补一个，跨帧拼接后会多出一个字符。
+    m = _LEAK_MARKER_RE.match(t)
+    if m:
+        # 只归一**已存在**的括号：原本没写尾括号就不补（否则跨帧拼接多一个字符）；
+        # 写了 > / ) / ] 则统一成 ]，保持「一个 marker 只有一个闭括号」。
+        _close = "]" if m.group(0).rstrip()[-1:] in ("]", ">", ")") else ""
+        return lead + _MARKER_OPEN_CANON + _close + t[m.end():]
     if t.startswith("```"):
         rest = t[3:]
         low = rest.lstrip().lower()
@@ -3327,9 +3369,10 @@ def _normalize_leak_marker(text):
             after = rest.lstrip()[4:].lstrip()
         else:
             after = rest.lstrip()
-        if after.startswith(LEAK_MARKER_ALT):
+        m2 = _LEAK_MARKER_RE.match(after)
+        if m2:
             return (lead + t[:len(t) - len(after)]
-                    + LEAK_MARKER + after[len(LEAK_MARKER_ALT):])
+                    + LEAK_MARKER + after[m2.end():])
     return text
 
 
@@ -3612,24 +3655,25 @@ def parse_leaked_tool_calls(text, allowed_names=None):
     # issue #51：截图里出现「闭标签 + 数组」（无 marker）与「marker + 杂字 + 数组」。
     # 先剥掉前导的 DSML 闭合标签，再决定起点。
     t = re.sub(r"^(?:\s*</[^>]*DSML[^>]*>)+", "", t).strip()
-    _mpos = t.rfind(LEAK_MARKER)
+    # issue #60 follow-up：marker 可能写成 [<assistant …] / 尾括号缺失，
+    # 用正则取**最后一个**变体，避免每出现一种括号组合就漏一次。
+    _mpos, _mend = _last_marker_span(t)
     if _mpos < 0:
         # 无 marker：允许「整段就是 [{name, arguments}] 数组」（严格校验仍在下面）
         if t.startswith("["):
-            _mpos = 0
             t = LEAK_MARKER + chr(10) + t     # 复用同一套解析路径
+            _mpos, _mend = 0, len(LEAK_MARKER)
         else:
             return None, text
-    prefix = t[:_mpos]
-    # 前缀尾部可能残留 marker（「散文 + marker1 + marker2 + 数组」时，
-    # marker1 落在 prefix 里）——它绝不能当正文发给客户端。
-    prefix = prefix.rstrip()
-    for _mk in (LEAK_MARKER, LEAK_MARKER_ALT):
-        while prefix.endswith(_mk):
-            prefix = prefix[:-len(_mk)].rstrip()
-    t = t[_mpos:]
-    while t.startswith(LEAK_MARKER):
-        t = t[len(LEAK_MARKER):].lstrip()
+    # 前缀里残留的任何 marker 变体都不能当正文发给客户端。
+    prefix = _LEAK_MARKER_RE.sub("", t[:_mpos]).rstrip()
+    t = t[_mend:]
+    while True:
+        _m = _LEAK_MARKER_RE.match(t.lstrip())
+        if not _m:
+            break
+        t = t.lstrip()[_m.end():]
+    t = t.lstrip()
     t = _strip_dsml_close_tail(t)
     if t.endswith(_JSON_FENCE) and len(t) > len(_JSON_FENCE):
         t = _strip_dsml_close_tail(t[:-len(_JSON_FENCE)].rstrip())
@@ -3695,21 +3739,23 @@ def _leak_body_offset(text):
     t = _normalize_leak_marker((text or "")).lstrip()
     if not t or LEAK_MARKER.startswith(t):
         return "pre", None
-    if t.startswith(LEAK_MARKER):
+    _m = _LEAK_MARKER_RE.match(t)
+    if _m:
         # issue #49：模型会连写两个 marker（数组在第二个之后）——跳过重复的，
         # 否则 hold 会被判成「body 不是数组」而在流式中途证伪、整块补发。
-        body = t[len(LEAK_MARKER):]
-        b = body.lstrip()
-        while b.startswith(LEAK_MARKER):
-            b = b[len(LEAK_MARKER):].lstrip()
-        # 重复 marker 还没打完（跨帧，如 "[assista"）——仍算候选，内容留空等下一帧。
-        # 不回 "pre" 是因为此处已越过首个 marker，语义上是 body 但"暂时没内容"。
-        if b and (LEAK_MARKER.startswith(b) or LEAK_MARKER_ALT.startswith(b)):
+        b = t[_m.end():].lstrip()
+        while True:
+            _m2 = _LEAK_MARKER_RE.match(b)
+            if not _m2:
+                break
+            b = b[_m2.end():].lstrip()
+        # 重复 marker 还没打完（跨帧）——仍算候选，内容留空等下一帧。
+        if b and _marker_prefix_ok(b):
             return "body", ""
         return "body", b
-    # issue #36 后续：尖括号变体的**真前缀**（跨帧进行中）同样算 pre——
-    # 1 字符/帧时 '<' 单独到达，不能当散文放出（否则 marker 开头丢失）。
-    if LEAK_MARKER_ALT.startswith(t):
+    # issue #60 follow-up：任意括号组合的**真前缀**（跨帧进行中）同样算 pre——
+    # 1 字符/帧时 '[' 或 '<' 单独到达，不能当散文放出（否则 marker 开头丢失）。
+    if _marker_prefix_ok(t):
         return "pre", None
     if not t.startswith("`"):
         return "no", None
@@ -3826,19 +3872,23 @@ def _find_marker_split(text, allow_prefix=True):
     if not t:
         return "", ""
     best = -1
-    for mk in (LEAK_MARKER, TOOL_RESULT_MARKER):
-        i = t.find(mk)
-        if i != -1 and (best == -1 or i < best):
-            best = i
+    # issue #60 follow-up：任意括号变体（[<assistant …] / 尾括号缺失）都要能切开，
+    # 否则「散文 + marker」同帧到达时整块被当正文发出去。
+    _m = _LEAK_MARKER_RE.search(t)
+    if _m:
+        best = _m.start()
+    i = t.find(TOOL_RESULT_MARKER)
+    if i != -1 and (best == -1 or i < best):
+        best = i
     if best != -1:
         return t[:best], t[best:]
     if not allow_prefix:
         return t, ""
     tail = t[-_MARKER_HOLD_WINDOW:] if len(t) > _MARKER_HOLD_WINDOW else t
-    for mk in (LEAK_MARKER, LEAK_MARKER_ALT, TOOL_RESULT_MARKER):
-        for n in range(min(len(tail), len(mk) - 1), 0, -1):
-            if tail.endswith(mk[:n]):
-                return t[:-n], t[-n:]
+    for n in range(len(tail), 0, -1):
+        seg = tail[-n:]
+        if _marker_prefix_ok(seg) or TOOL_RESULT_MARKER.startswith(seg):
+            return t[:-n], t[-n:]
     return t, ""
 
 
@@ -3846,6 +3896,10 @@ def _marker_starts_at(text):
     """text 是否以某标记开头，或整段就是它的真前缀（跨帧补全中）。"""
     t = text or ""
     if not t:
+        return True
+    # issue #60 follow-up：括号变体（[<assistant …] / 缺尾括号）同样算命中；
+    # 单靠 startswith(常量) 会让大块开头的变体直接漏出去。
+    if _LEAK_MARKER_RE.match(t) or _marker_prefix_ok(t):
         return True
     for mk in (LEAK_MARKER, LEAK_MARKER_ALT, TOOL_RESULT_MARKER):
         if t.startswith(mk):
@@ -3868,7 +3922,8 @@ def _still_leak_candidate(text):
     # issue #51：marker 之后可能先跟一小段杂字（">、=、: 等）再进数组，
     # 且数组开头的 [ 可能丢了（直接 {"name":...}）。两种都保持候选，
     # 由流末 parse（含补括号启发式）决定成败。
-    _trimmed = rest.lstrip(chr(34) + chr(39) + ">=: ").lstrip()
+    # issue #60 follow-up：marker 变体可能多带一个 ]（[assistant …]]），也算杂字。
+    _trimmed = rest.lstrip(chr(34) + chr(39) + ">=: ]").lstrip()
     if not _trimmed:
         return True          # 目前全是杂字（还没进数组）：继续等
     if _trimmed[0] in "[{":
@@ -4202,6 +4257,22 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
             # 当正文补发——直接升级为协议错误（提前判定，不等流末）。
             if _echo_with_bad_args(hold, allowed_names):
                 raise InvalidToolArguments()
+            # issue #60 follow-up：散文 + marker 落在同一个大块时，hold 以散文开头
+            # 会直接证伪——整块（含协议正文）被当正文补发。这里先把散文前缀放行，
+            # 只保留 marker 起的部分继续判候选。
+            _last_m = None
+            for _mm in _LEAK_MARKER_RE.finditer(hold or ""):
+                _last_m = _mm
+            if _last_m is not None and _last_m.start() > 0:
+                _tail60 = hold[_last_m.start():]
+                if _still_leak_candidate(_tail60):
+                    _prose60 = hold[:_last_m.start()]
+                    if _prose60.strip():
+                        yield _leak_chunk_frame(meta, {"content": _prose60})
+                    hold = _tail60
+                    if fin:
+                        finished = (_frame_without_content(payload), fin)
+                    continue
             # issue #49 方向 C：候选被证伪 -> 整段当正文补发，这里同样留痕
             # （形态3「marker + <terminal></terminal> 空壳」就走这条：没有 JSON
             # 可恢复，但必须让发生率可见，而不是静默失真）。
@@ -4614,7 +4685,10 @@ def _current_turn_start(messages):
 # Anthropic 入口，1,283 次工具调用 0 降级；同环境开启前基线 0.30%）。
 # 结构化直传后模型看不到 LEAK_MARKER 文本格式，也就无从复述——这是治本项。
 # _tool_ids_ok 守卫仍在：客户端 id 不齐备时自动回退文本化，不会踩坑。
-STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5", "deepseek")
+# issue #60 follow-up：DeepSeek 的**上游 key 是 `dfmodel`**（显示名 DeepSeek-V4-Flash），
+# 只写 "deepseek" 匹配不到 -> auto 一直是文本化，模型照抄伪协议。两个都保留。
+STRUCTURED_TOOL_HISTORY_WHITELIST = ("qwen", "glm", "gm4", "gm5",
+                                   "deepseek", "dfmodel")
 _STRUCTURED_LOG_ONCE = {"done": False}
 
 

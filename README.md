@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.10-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.11-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -517,6 +517,23 @@ python _verify_models.py --base http://127.0.0.1:8790
 - 席位被回收、token 被重置（反代立即失效）；
 - 把公司席位共享给组织外的人（额度、审计、条款三条都会踩线）；
 - 数据中心出口访问**国际版**容易被风控（见 #57 的容器告警）。
+
+### v1.5.11
+
+**🐛 问题修复（#60 后续：zcode 工具调用仍截断/漏成正文）**
+
+- **`dfmodel` 没进结构化白名单**：DeepSeek 的上游 key 是 **`dfmodel`**（显示名 DeepSeek-V4-Flash），
+  白名单只写 `deepseek` 匹配不到 → auto 一直是文本化，模型照抄伪协议复述。现已加入，
+  这类会话直接走结构化直传，**从源头不再产生可复述的伪格式**。
+- **marker 括号变体**：新增 `[<assistant 请求调用工具]`、缺尾括号、多括号等形态的统一识别
+  （一条正则 + 前缀判定），不再「换一种括号就漏一次」。
+- **散文与 marker 落在同一个大块**：此前整块以散文开头会被判「不是回声」直接透传；
+  现在先把散文前缀放行、只保留 marker 起的部分继续判候选。
+- **逐字节守恒**：归一化只规范化**已存在**的括号，不再给缺失尾括号的片段补字符
+  （修掉跨帧拼接多一个 `]` 的回归）。
+
+**验证**：新增 `tests/_test_issue60_followup.py`（17 条，覆盖 1/8/64/整段分帧、
+散文同帧、双括号守恒、未声明工具名不恢复）；全量 **44 suites / 1498 checks / 0 failed**。
 
 ### v1.5.10
 
