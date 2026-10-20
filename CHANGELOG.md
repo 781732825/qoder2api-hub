@@ -2,6 +2,23 @@
 
 每个版本的发布说明同步在 [GitHub Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
+## v1.5.13
+
+**✨ 新增功能**
+
+- **一键更新**：看板「运行信息」检测到新版本后出现 **一键更新** 按钮，点击后网关自己完成
+  「下载官方 release → 编译校验 → 备份 → 替换 → 自动重启 → 页面自动刷新」。
+  - 来源固定为 GitHub 官方 release 的源码 tarball，不接受任意 URL；解压先过滤路径穿越；
+  - 替换前核对 `VERSION` 必须等于目标 tag，且 release 内所有 `.py` 都能编译；
+  - 覆盖前把本次会动的文件备份到 `backups/update-<旧版本>-<时间戳>/`，任一步失败**自动回滚**；
+  - `accounts/`、`python/`、`backups/`、`.git/`、日志与 PID **永不覆盖**；
+  - 更新完成后按原启动参数拉起新进程（`os._exit` 交棒），页面轮询 `/health` 自动刷新。
+  - 安全边界：端点要求面板会话、默认**只允许本机**触发；`QD_UPDATE_DISABLE=1` 可完全禁用；
+    容器内默认拒绝自更新并提示改用 `docker compose pull`。
+  - 新增 `GET /update/plan`（预检：当前/最新版本、是否容器、是否禁用）与 `POST /update/apply`。
+
+**验证**：新增 `tests/_test_update_oneclick.py` 21 条（文件选择、保护路径、版本/语法校验、解压穿越防护、容器拒绝、端点守卫、面板接线），并做了本地假 release 的端到端替换验证（版本变更、备份存在、`accounts/` 保留、新文件同步）。全量 **48 suites / 1560 checks / 0 failed**。
+
 ## v1.5.12
 
 **🐛 问题修复**

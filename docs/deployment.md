@@ -153,7 +153,30 @@ docker run -d --name qoder-proxy --restart unless-stopped \
 
 | 部署方式 | 升级步骤 |
 |---|---|
-| 源码 | `git pull`，然后重启网关（Windows 先运行 `stop-qoder-proxy.bat`，再运行 `start-qoder-proxy.bat`） |
+| **一键更新（源码部署）** | 看板「运行信息」→ 有新版本时点 **一键更新**，见下 |
+| 源码（手动） | `git pull`，然后重启网关（Windows 先运行 `stop-qoder-proxy.bat`，再运行 `start-qoder-proxy.bat`） |
 | Docker | `docker compose pull && docker compose up -d` |
 
-看板「设置 → 运行信息」会检查 GitHub 上是否有新版本。各版本的变更见[更新日志](../CHANGELOG.md)。
+各版本的变更见[更新日志](../CHANGELOG.md)。
+
+### 一键更新（看板按钮）
+
+检测到新版本后，「运行信息」卡片会出现 **一键更新** 按钮。点击后网关自己完成：
+
+1. 从 **GitHub 官方 release** 下载源码 tarball（只认这一个来源）；
+2. 解压到临时目录，**逐个 `.py` 编译校验**，并核对 `VERSION` 必须等于目标 tag；
+3. 把本次会被覆盖的文件**先备份**到 `backups/update-<旧版本>-<时间戳>/`；
+4. 覆盖代码文件后**自动重启**（按原启动参数拉起新进程）；
+5. 页面轮询 `/health`，版本变化后自动刷新。
+
+**不会被覆盖的**：`accounts/`（账号与设置）、`python/`（内置运行时）、`backups/`、`.git/`、日志与 PID 文件。
+
+任一步失败都会**从备份回滚**并保留旧版本运行；失败原因会直接显示在卡片上。
+
+| 环境变量 | 默认 | 说明 |
+|---|---|---|
+| `QD_UPDATE_DISABLE` | 关 | 设为 `1` 完全禁用更新端点（只保留「检查新版本」） |
+| `QD_UPDATE_ALLOW_REMOTE` | 关 | 更新端点默认**只允许本机**访问；设为 `1` 才允许远程触发（面板会话仍然是必需的） |
+| `QD_UPDATE_ALLOW_CONTAINER` | 关 | 容器里默认拒绝自更新（镜像重建会覆盖），改为在宿主机 `docker compose pull` |
+
+> 容器部署请用 `docker compose pull`：镜像里的代码由镜像决定，容器内自更新会被下次重建覆盖。

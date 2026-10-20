@@ -52,12 +52,13 @@ import qoder_anthropic
 import qoder_catalog
 import qoder_settings
 import qoder_sign
+import qoder_updater
 from qoder_sign import qoder_encode, SESSIONS
 from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.12"
+VERSION = "1.5.13"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3061,6 +3062,55 @@ def requested_effort(payload):
         effort = (payload.get("thinking") or {}).get("effort")             or (payload.get("thinking") or {}).get("level")
     return effort or None
 
+
+# ---------------------------------------------------------------------------
+# 一键更新（面板按钮 -> 下载 release -> 校验 -> 备份 -> 替换 -> 自动重启）
+# ---------------------------------------------------------------------------
+_LAUNCH_ARGV = list(sys.argv)          # 更新后按原参数重启
+APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+UPDATE_DISABLED = str(os.environ.get("QD_UPDATE_DISABLE") or "").strip().lower() \
+    in ("1", "on", "true", "yes", "enable", "enabled")
+_UPDATE_LOCK = threading.Lock()
+
+
+def _update_allow_remote():
+    return str(os.environ.get("QD_UPDATE_ALLOW_REMOTE") or "").strip().lower() \
+        in ("1", "on", "true", "yes", "enable", "enabled")
+
+
+def _is_loopback(host):
+    host = str(host or "")
+    return host in ("::1", "localhost") or host.startswith("127.") \
+        or host.startswith("::ffff:127.")
+
+
+def update_plan_info():
+    """一键更新的预检信息（不下载、不改文件）。"""
+    cur = VERSION
+    latest = ""
+    err = ""
+    try:
+        latest = qoder_updater.latest_release().get("version") or ""
+    except Exception as exc:
+        err = str(exc)[:160]
+    has = bool(latest) and version_tuple(latest) > version_tuple(cur)
+    return {
+        "ok": True,
+        "current": cur,
+        "latest": latest,
+        "has_update": has,
+        "container": qoder_updater._in_container(),
+        "disabled": UPDATE_DISABLED,
+        "can_apply": bool(has) and not UPDATE_DISABLED,
+        "state": qoder_updater.state(),
+        "error": err,
+    }
+
+
+def apply_update_now(tag=None):
+    """执行更新（阻塞）；成功后调用方负责触发重启。"""
+    with _UPDATE_LOCK:
+        return qoder_updater.apply_update(APP_ROOT, tag=tag)
 
 # ---------------------------------------------------------------------------
 # 项目新版本检测（对比 GitHub 最新 release；结果缓存 6 小时）
@@ -7882,6 +7932,13 @@ class Handler(BaseHTTPRequestHandler):
                     force=bool(_u.get("force", [None])[0])))
             except Exception as exc:
                 return self._error(500, "update check failed: %s" % exc)
+        if path == "/update/plan":
+            # 一键更新前的预检（issue: 一键更新）：能不能更新、当前/目标版本、
+            # 是否容器、是否被禁用。不下载任何东西。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            return self._json(200, update_plan_info())
         if path == "/diag/vm":
             # 本机虚拟化检测（看板「签到与福利中心」展示；中文输出）。
             # 以官方风控桥 runtime-info.exe 的 vmInfo 为准，桥不可用时本机交叉校验。
@@ -9163,6 +9220,36 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         path = self.path.split("?")[0]
+        if path == "/update/apply":
+            # 一键更新：下载官方 release -> 校验 -> 备份 -> 替换 -> 自动重启。
+            # 只允许面板会话 + 本机（可用 QD_UPDATE_ALLOW_REMOTE=1 放开）。
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            if UPDATE_DISABLED:
+                return self._error(403, "update is disabled (QD_UPDATE_DISABLE=1)",
+                                   "invalid_request_error")
+            if qoder_updater._in_container():
+                return self._error(409,
+                                   "运行在容器里：镜像重建会覆盖本地改动，请在宿主机"
+                                   "执行 docker compose pull && docker compose up -d",
+                                   "invalid_request_error")
+            if not _update_allow_remote() and not _is_loopback(
+                    (self.client_address or ["?"])[0]):
+                return self._error(403, "update is loopback-only "
+                                        "(set QD_UPDATE_ALLOW_REMOTE=1 to allow)",
+                                   "invalid_request_error")
+            try:
+                res = apply_update_now()
+            except Exception as exc:
+                return self._error(500, "update failed: %s" % exc)
+            if not res.get("ok"):
+                return self._json(200, res)
+            restarted = qoder_updater.schedule_restart(_LAUNCH_ARGV, delay=1.5)
+            log("update: %s -> %s (%d files, backup=%s), restarting=%s"
+                % (res.get("from"), res.get("to"), len(res.get("files") or []),
+                   res.get("backup") or "-", restarted), tag="update")
+            return self._json(200, dict(res, restarting=restarted))
         if path == "/settings/save":
             if not self._panel_ok():
                 return self._error(401, "panel password required",
