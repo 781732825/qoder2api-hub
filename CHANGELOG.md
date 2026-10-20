@@ -2,6 +2,26 @@
 
 每个版本的发布说明同步在 [GitHub Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
+## v1.5.12
+
+**🐛 问题修复**
+
+- **同一组织多账号的共享额度池被重复累加**（#67，报告者 YuEr159）：`/credits/summary` 逐账号累加 `remain_effective`，而组织共享池在**每个账号**的 quota 响应里都会回显一份 → 5 个账号把 1,000,000 乘成 4,000,000。现在汇总按 `organization_id` 去重（同组织只算一次），无限池不计入数字、单列 `unlimited_orgs`；行内新增 `credits_counted` / `credits_org` / `credits_shared_unlimited`，原 `credits_remain_effective` 保留。
+- **`cap: -1` 被当成真实余额**（#67）：`cap` 为负是「不设上限」的哨兵，`remaining` 只是占位（`used` 恒 0、各账号回显一致）。现在标记 `shared.unlimited`，占位值**不再**计入 `remain_effective`；余额地板护栏（G1）与 402 解封对无限池改为**显式语义**（不拦 / 直接解封），不再靠「数字很大所以碰巧没触发」。
+- **413 友好文案从未生效**（PR #65 by maiphucguy）：`friendly_upstream_error` 里 #59 新增的分支被写成了一行带字面量 `\n` 的注释，整段是死代码；对应断言恒为真。已恢复为真实代码，断言改为严格判断 `type == payload_too_large`。
+- **请求自身的 4xx 让全池冷却 60 秒**（PR #65）：内容审核 / 参数非法 / 上游 413 这类「换号结果不变」的错误，此前会逐号冷却换号，期间其他请求直接 503。新增 `_is_request_fault()`：命中时不换号、不冷却，原错误直接抛给客户端（`authentication_error` / `permission_error` 仍走轮换）。
+- **全池同样失败会熔断 30 分钟**（PR #65）：断网 / 上游整体故障这类与账号无关的失败，此前每请求给每个账号各记一次，3 次即熔断，且熔断期间没有成功请求来复位。改为**延迟记账**：只有「同一请求换号后成功」才给先前失败的账号记 `note_failure` / `note_unknown_failure`；全池同样失败则不计入（日志可见）。短冷却、429 软限流、401/403、团队租约、风险遥测行为不变。
+- **模型文案内嵌快照自 v1.1.0 冻结**（#68，报告者 YuEr159）：`load_official_text()` 只扫 Windows 安装目录，Linux / 容器（home=/root）永远匹配不到 → 静默回退内嵌快照，快照里还写着早已下线的 `DeepSeek-V4-Flash-0731` / `V4-Pro-0813`。现在：
+  - 内嵌快照按 Qoder 现行文档重写，**不再带版本号后缀**；`kmodel` label 与上游清单对齐（Kimi-K2.8-Preview）；
+  - 新增 `QD_OFFICIAL_TEXT=/path/to/qoder-cn.json`（文件或目录）显式覆盖，并扫描 `/app/assets/dynamic-text` 等容器挂载点与 Linux/macOS 客户端位置；
+  - 回退内嵌快照时打一条 WARN（只一次），不再静默。
+
+**📚 文档**
+
+- **README 重写与拆分**（PR #66 by maiphucguy）：1737 行压到 103 行（特性 / 快速开始 / 客户端接入 / 文档索引），其余按主题拆到 `docs/`（deployment / configuration / internals / accounts / clients / models / api / development / troubleshooting），发布说明移入 `CHANGELOG.md`；徽章改为动态 release / CI 状态。PR 里还逐条核对了 **11 处「README 与代码不一致」**（intl 网关顺序、机器头回退、`/models/refresh` 鉴权、推理 UA 仍是 Go 默认值、`thinking=disabled` 并不真正关闭思考等），其中属于代码问题的几项留待后续。
+
+**验证**：全量 **47 suites / 1539 checks / 0 failed**（新增 `_test_issue67_org_shared.py` 13 条、`_test_issue68_model_text.py` 10 条，PR #65 自带 11 条）。
+
 ## v1.5.11
 
 **🐛 问题修复（zcode 工具调用仍被截断或漏成正文）**
