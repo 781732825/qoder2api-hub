@@ -1254,6 +1254,12 @@ class Account(object):
         self.credits_refresh_error = ""
         self.credits_refresh_failures = 0
         self.credits_refresh_next = 0.0
+        # issue #56：团队/企业账号的自用保护（并发闸门 + 最小间隔 + 客户端统计）。
+        # 全部是**内存态**，不落盘，不影响凭证文件格式。
+        self._team_lock = threading.Lock()
+        self.team_leases = {}
+        self.team_last_start = 0.0
+        self.team_client_ips = {}
         # issue #40 后续：最近一次「上游返回全 0 退化体」的降级标记（面板显示 0*）
         self.credits_degraded = data.get("creditsDegraded") or None
         # ---- task-61：账号级预算护栏状态（默认全关；计数 None = 未知 -> fail-open）----
