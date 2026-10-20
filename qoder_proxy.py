@@ -1194,6 +1194,8 @@ def credits_summary():
     by_realm = {}
     rows = []
     total_remain = 0
+    seen_orgs = set()        # 已计入过共享池的组织（跨账号去重，issue #67）
+    unlimited_orgs = set()   # cap=-1 的组织共享池
     accounts = list(POOL.accounts) if POOL else []
     for a in accounts:
         cred = getattr(a, "credits", None)
@@ -1201,8 +1203,23 @@ def credits_summary():
             cred = {}
         realm = getattr(a, "realm", "") or ""
         remain = cred.get("remain")
-        # issue #39：团队账号的套餐 may 用满而共享池仍有余额——汇总按有效余额，
-        # 同时保留原始 remain 便于核对（两者都会出现在行里）。
+        shared = cred.get("shared") if isinstance(cred.get("shared"), dict) else None
+        # issue #67：共享池是**组织级**资源，同一组织下每个账号的 quota 响应都会
+        # 回显同一份；逐账号累加会把 1,000,000 乘成 4,000,000。这里按
+        # organization_id 去重，没有组织标识的（个人号）才按账号算。
+        org = str(getattr(a, "organization_id", "") or "")
+        org_key = ("org", org) if org else ("uid", getattr(a, "uid", "") or "")
+        unlimited = bool(shared and shared.get("unlimited"))
+        plan_remain = remain if isinstance(remain, (int, float)) \
+            and not isinstance(remain, bool) else 0
+        shared_counted = 0
+        if unlimited:
+            unlimited_orgs.add(org_key)
+        elif shared and shared.get("available", True):
+            if org_key not in seen_orgs:
+                seen_orgs.add(org_key)
+                shared_counted = int(shared.get("remain") or 0)
+        # 行内仍保留账号视角的 effective（套餐+共享），另给 counted 便于核对汇总
         eff = qoder_accounts.effective_remain(cred)
         rows.append({
             "uid": getattr(a, "uid", "") or "",
@@ -1210,19 +1227,23 @@ def credits_summary():
             "realm": realm,
             "credits_remain": remain,
             "credits_remain_effective": eff,
-            "credits_shared_remain": (cred.get("shared") or {}).get("remain")
-            if isinstance(cred.get("shared"), dict) else None,
+            "credits_counted": int(plan_remain) + shared_counted,
+            "credits_org": org,
+            "credits_shared_unlimited": unlimited,
+            "credits_shared_remain": (shared or {}).get("remain"),
             "credits_used": cred.get("used"),
             "credits_size": cred.get("size"),
             # 登记时间：credits.updated_at（fetch_credits 写入），不是文件 mtime。
             "registered_at": cred.get("updated_at"),
         })
-        if isinstance(eff, (int, float)) and not isinstance(eff, bool):
-            by_realm[realm] = by_realm.get(realm, 0) + int(eff)
-            total_remain += int(eff)
+        total = int(plan_remain) + shared_counted
+        by_realm[realm] = by_realm.get(realm, 0) + total
+        total_remain += total
     return {
         "by_realm": by_realm,
-        "totals": {"remain": total_remain, "accounts": len(rows)},
+        "totals": {"remain": total_remain, "accounts": len(rows),
+                   "unlimited_orgs": len(unlimited_orgs),
+                   "shared_deduped": True},
         "accounts": rows,
         "note": _CREDITS_SUMMARY_NOTE,
     }

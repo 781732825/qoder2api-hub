@@ -843,6 +843,14 @@ def normalize_epoch(value):
     return int(number)
 
 
+def shared_unlimited(credits):
+    """共享池是否是「不设上限」（cap=-1，issue #67）。"""
+    if not isinstance(credits, dict):
+        return False
+    shared = credits.get("shared")
+    return bool(isinstance(shared, dict) and shared.get("unlimited"))
+
+
 def effective_remain(credits):
     """有效余额 = 套餐 remain + 可用的共享池 remain（issue #39）。
 
@@ -1486,6 +1494,10 @@ class Account(object):
             return False
         # issue #39：团队账号「套餐已用满 + 共享池仍有余额」按有效余额判定，
         # 否则共享额度白有、账号被误停。
+        if shared_unlimited(cred):
+            # issue #67：组织共享池 cap=-1（不设上限）——地板护栏不该拦，
+            # 而且必须是**显式**语义，不能靠「数字很大所以碰巧没触发」。
+            return False
         remain = effective_remain(cred)
         if remain is None:
             return False
@@ -1663,6 +1675,11 @@ class Account(object):
             return False
         cred = self.credits
         # issue #39：团队账号可能套餐 remain=0 但共享池仍有余额——按有效余额解封。
+        if shared_unlimited(cred):
+            # issue #67：无限共享池 = 有可用额度，402 停放应立即解除。
+            self.balance_until = 0.0
+            self.balance_reason = ""
+            return True
         remain = effective_remain(cred)
         try:
             if remain is None or float(remain) <= 0:
@@ -2676,6 +2693,8 @@ class Account(object):
                 shared = {
                     "remain": int(_num(_src, "remaining")),
                     "used": int(_num(_src, "used")),
+                    # issue #67：cap=-1 是「不设上限」的哨兵值，不是真实额度；
+                    # remaining 往往只是占位填数（used 恒 0、同组织各账号回显一致）。
                     "size": int(_num(_src, "cap") or _num(_src, "total")),
                     # 缺键 = "没声明不可用" = 可用（与原 bool(_src.get("available", True)) 等价）；
                     # 显式 null / "false" / 0 = 不可用。写成 .get(k, True) + 默认 True
@@ -2685,6 +2704,9 @@ class Account(object):
                     "source": _key,
                     **_expiry_of(_src),
                 }
+                if shared["size"] < 0:
+                    # 无限池：display 与护栏都不应把占位的 remaining 当余额
+                    shared["unlimited"] = True
                 break
             if isinstance(_src, (int, float)) and not isinstance(_src, bool):
                 shared = {"remain": int(_src), "used": 0, "size": int(_src),
@@ -2704,7 +2726,8 @@ class Account(object):
         # ——有效余额 = 套餐 remain + 可用的共享 remain。护栏与汇总按它判断，
         # 否则「套餐用满但共享池还有 952」会被误判为余额耗尽。
         _shared_avail = (shared.get("remain") or 0) \
-            if (shared and shared.get("available", True)) else 0
+            if (shared and shared.get("available", True)
+                and not shared.get("unlimited")) else 0
         remain_effective = int(remain + _shared_avail)
         self.credits = {
             "remain": remain,
