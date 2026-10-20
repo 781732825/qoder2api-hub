@@ -2554,6 +2554,7 @@ function accountRow(a){
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
+    + (a.note ? ('<div class="hint" style="margin:3px 0 0" title="备注（issue #69）"><span style="color:var(--accent)">备注</span> ' + esc(a.note) + '</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
@@ -2567,6 +2568,7 @@ function accountRow(a){
     +     '<button class="sec mini" onclick="toggleAccount(&quot;' + uidAttr + '&quot;,' + (!a.enabled) + ', this)">' + (a.enabled ? '停用' : '启用') + '</button>'
     +     '<button class="sec mini" onclick="testAccount(&quot;' + uidAttr + '&quot;, this)">测试</button>'
     +     '<button class="sec mini" onclick="refreshOne(&quot;' + uidAttr + '&quot;, this)">刷新</button>'
+    +     '<button class="sec mini" onclick="editAccountNote(&quot;' + uidAttr + '&quot;, this)">备注</button>'
     +   '</div>'
     +   '<div style="display:flex;gap:4px;justify-content:center">'
     +     '<button class="sec mini" onclick="exportOne(&quot;' + uidAttr + '&quot;)">导出</button>'
@@ -2576,6 +2578,24 @@ function accountRow(a){
     + '</td></tr>';
 }
 
+
+// issue #69：账号备注（纯展示字段，服务端 /accounts/note）
+async function editAccountNote(uid, btn){
+  const acc = (window.ACCOUNTS || []).find(a => String(a.uid) === String(uid));
+  const cur = acc && acc.note ? acc.note : "";
+  const val = prompt("给这个账号加个备注（比如「公司团队号」「备用」）：", cur);
+  if(val === null) return;
+  if(btn){ btn.disabled = true; btn.textContent = "保存中…"; }
+  try{
+    const r = await postJSON("/accounts/note", {uid: uid, note: String(val || "").slice(0, 120)});
+    if(acc) acc.note = r.note || "";
+    renderAccounts();
+    toast("备注已保存", "ok");
+  }catch(e){
+    toast("保存失败: " + ((e && e.message) || e), "bad");
+    if(btn){ btn.disabled = false; btn.textContent = "备注"; }
+  }
+}
 function renderAccounts(){
   const box = document.getElementById('accounts');
   const currentView = (window.VIEW_REALM || "intl");
@@ -3594,6 +3614,7 @@ async function loadSettings(showToast){
     // Rebuild the editable rows, keeping stored values so an untouched field
     // is not accidentally blanked.
     API_KEY_ROWS = (data.api_keys || []).map(k => ({
+    note: k.note || '',
       id: k.id || '',
       name: k.name || '',
       key: '',
@@ -3692,6 +3713,11 @@ function renderKeyRows(){
         +     '</select>'
         +   '</div>'
         +   '<div style="grid-column:1 / -1">'
+        +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">备注（可选，长说明）</div>'
+        +     '<input type="text" id="editKeyNote_' + i + '" value="' + esc(row.note || '') + '" placeholder="如: 给团队 A 用 / 每月限额 500 万 token" '
+        +       'style="width:100%;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:7px 10px;font:inherit;color:var(--fg)">'
+        +   '</div>'
+        +   '<div style="grid-column:1 / -1">'
         +     '<div style="font-size:12px;color:var(--dim);margin-bottom:4px;font-weight:500">API Key 内容 ' + (row.masked ? '<span style="color:var(--dim-light)">(已保存: ' + esc(row.masked) + '，留空表示不改)</span>' : '') + '</div>'
         +     '<div style="display:flex;gap:8px">'
         +       '<input type="text" id="editKeyValue_' + i + '" value="' + esc(row.key || '') + '" placeholder="' + (row.masked ? '留空表示保持原 Key 不变' : '输入自定义密钥，或点击右侧生成') + '" '
@@ -3732,6 +3758,7 @@ function renderKeyRows(){
       +       '<span>Key: <span class="mono" style="color:var(--fg);font-weight:500">' + esc(displayKey) + '</span></span>'
       +       (createdStr ? ('<span>' + createdStr + '</span>') : '')
       +     '</div>'
+      +     (row.note ? ('<div style="font-size:12px;color:var(--accent);margin-top:6px" title="备注">' + esc(row.note) + '</div>') : '')
       +   '</div>'
       +   '<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">'
       +     '<button class="key-action-btn" id="copyBtn' + i + '" onclick="copyKeyRow(' + i + ')">复制</button>'
@@ -3773,10 +3800,12 @@ async function saveSingleKey(index, btn){
   const nameInput = document.getElementById('editKeyName_' + index);
   const realmSelect = document.getElementById('editKeyRealm_' + index);
   const keyInput = document.getElementById('editKeyValue_' + index);
+  const noteInput = document.getElementById('editKeyNote_' + index);
 
   const name = nameInput ? nameInput.value.trim() : (row.name || '');
   const realm = realmSelect ? realmSelect.value : (row.realm || '');
   const keyVal = keyInput ? keyInput.value.trim() : (row.key || '');
+  const note = noteInput ? noteInput.value.trim() : (row.note || '');
 
   if(!keyVal && !row.masked){
     toast('API Key 不能为空', 'warn');
@@ -3785,6 +3814,7 @@ async function saveSingleKey(index, btn){
 
   row.name = name || '未命名';
   row.realm = realm;
+  row.note = note;
   if(keyVal) row.key = keyVal;
   row._editing = false;
 
@@ -3893,6 +3923,7 @@ async function saveApiKeys(btn){
     enabled: row.enabled !== false,
     // Blank means "keep the stored key", which the server honours per row.
     key: (row.key || '').trim(),
+    note: (row.note || '').trim(),
   }));
   const newRow = API_KEY_ROWS.find(row => !row.masked && !(row.key || '').trim());
   if(newRow){

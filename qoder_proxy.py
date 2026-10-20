@@ -58,7 +58,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.13"
+VERSION = "1.5.14"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5953,6 +5953,11 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     last_error = None
     last_429 = None
     last_429_detail = ""
+    last_queue_wait = 0        # 队列 403（10605）解析出的 retryAfterSeconds
+    # 排队预算按**请求**计（不是按账号）：否则 N 个账号各等满 6 轮，
+    # 单请求会被拖到 3N 分钟（现场就出现过 197s）。
+    queue_tries = 0
+    queue_start = time.time()
     waited_cool = False
     # 熔断/降权三族（note_failure/note_unknown_failure）先记进 blame，延迟到
     # 「同一请求换号成功」才落账：全部账号同样失败时（本机断网、上游整体
@@ -6002,8 +6007,6 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         last_exc = None
         detail = ""
         tries = 0                 # 瞬时故障重试计数（1s/2s 退避）
-        queue_tries = 0           # 排队等待轮次（issue #38）
-        queue_start = time.time()
         while True:
             try:
                 sess = SESSIONS.get(account)
@@ -6104,6 +6107,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         _team_lease = None
 
         exc = last_exc
+        # 重试多轮时同一个异常的 body 可能已被读空：detail 为空就走挂在异常上的
+        # qoder_detail，否则排队判定会失灵、退回「凭证被拒」（现场 197s 后 key 失效）。
+        if not detail:
+            detail = getattr(exc, "qoder_detail", "") or ""
         # ---- 错误分类（与原有轮换语义一致） ----
         if isinstance(exc, urllib.error.HTTPError):
             if exc.code == 429:
@@ -6125,6 +6132,21 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
             if exc.code in (401, 403):
                 _is_queue_http = bool(_queue_wait_seconds(detail))
                 note_risk("queue" if _is_queue_http else "rejected", detail)
+                if _is_queue_http:
+                    # issue #69 现场：上游排队超过预算后仍返回 **HTTP 403 + 10605**。
+                    # 这是模型级排队，**不是**账号问题——绝不能按「凭证被拒」处理：
+                    # 冷却 60s 会把唯一账号打成「no usable account」，面板看起来
+                    # 就像「Key 失效」。这里只记录、换号（如果有别的号），不惩罚。
+                    last_429 = exc
+                    last_429_detail = detail
+                    last_queue_wait = _queue_wait_seconds(detail)
+                    log("upstream still queued (HTTP %s / 10605) on '%s' model "
+                        "'%s' after %ds - not penalising the account"
+                        % (exc.code, account.uid[:8], model,
+                           int(time.time() - queue_start)),
+                        level="WARN", tag="chat")
+                    last_error = exc
+                    continue
                 log("account %s rejected (HTTP %s), rotating"
                     % (account.uid[:8], exc.code))
                 # issue #64：排队(10605)不解绑会话亲和——排队是模型级的，换号
@@ -6213,8 +6235,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
             level="WARN", tag="chat")
     if last_error is not None:
         if last_429 is not None:
+            # 排队（10605/403）用上游给的 retryAfterSeconds，其余走模型冷却口径
             raise RateLimited(last_429, last_429_detail,
-                              wait=retry_after_seconds(model, realm))
+                              wait=last_queue_wait
+                              or retry_after_seconds(model, realm))
         raise last_error
     throttled, wait = realm_model_throttled(realm, model)
     if throttled:
@@ -9220,6 +9244,38 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             pass
         path = self.path.split("?")[0]
+        if path == "/accounts/note":
+            # issue #69：账号备注（面板内直接编辑；纯展示字段，不参与路由判定）
+            if not self._panel_ok():
+                return self._error(401, "panel password required",
+                                   "invalid_request_error")
+            try:
+                body = self._read_payload()
+            except Exception as exc:
+                return self._error(400, "invalid json: %s" % exc,
+                                   "invalid_request_error")
+            uid = str((body or {}).get("uid") or "").strip()
+            note = str((body or {}).get("note") or "").strip()[:120]
+            if not uid:
+                return self._error(400, "uid is required",
+                                   "invalid_request_error")
+            if not POOL:
+                return self._error(503, "account pool not ready",
+                                   "invalid_request_error")
+            hit = None
+            for acc in POOL.accounts:
+                if acc.uid == uid:
+                    hit = acc
+                    break
+            if hit is None:
+                return self._error(404, "account not found: %s" % uid,
+                                   "invalid_request_error")
+            hit.note = note
+            try:
+                hit.save(ACCOUNTS_DIR)
+            except Exception as exc:
+                return self._error(500, "save failed: %s" % exc)
+            return self._json(200, {"ok": True, "uid": uid, "note": note})
         if path == "/update/apply":
             # 一键更新：下载官方 release -> 校验 -> 备份 -> 替换 -> 自动重启。
             # 只允许面板会话 + 本机（可用 QD_UPDATE_ALLOW_REMOTE=1 放开）。

@@ -2,6 +2,24 @@
 
 每个版本的发布说明同步在 [GitHub Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
+## v1.5.14
+
+**🐛 问题修复**
+
+- **排队 403（10605）被当成「凭证被拒」，面板看起来像 Key 失效**：上游排队超过等待预算后返回 **HTTP 403 + `{"code":"10605","isQueued":true,"retryAfterSeconds":30}`**（双层转义）。旧逻辑走 401/403 分支 → `note_error(cooldown=60)` 冷却账号 → 单号池直接变成 `no usable account`，界面上就像「Key 无效」。
+  现在：**排队不是账号问题**——不冷却、不判死、不解绑会话亲和，只记录一条 WARN；全部账号都排队时抛 `RateLimited` 并按上游 `retryAfterSeconds` 回 `Retry-After`（客户端可据此退避）。真 `TOKEN_EXPIRE` 仍按原语义禁用账号。
+- **排队等待预算改为「请求级」**：此前 `queue_tries/queue_start` 在账号循环内重置，N 个账号各等满 6 轮，单请求会被拖到 3N 分钟（现场实测 197s）。现在整次请求共享 `QD_QUEUE_MAX_ROUNDS` / `QD_QUEUE_WAIT_BUDGET_SECS` 预算。
+- **错误体读空导致排队判定失灵**：多轮重试时同一异常的 body 可能已被读走，分类阶段 `detail` 为空 → 退回「凭证被拒」。现在回退取 `exc.qoder_detail`。
+
+**✨ 新增功能**
+
+- **账号 / API Key 备注**（#69）：
+  - 账号卡片新增 **备注** 按钮（`POST /accounts/note`，面板会话鉴权，最长 120 字），备注随账号文件持久化并在卡片上显示；
+  - API Key 编辑表单新增「备注（可选，长说明）」字段，随 `/settings/save` 持久化并在 Key 卡片上显示（原「备注名称」保留为短标签）。
+  - 两个字段都**不参与**任何路由/计费/风控判定，纯展示。
+
+**验证**：新增 `tests/_test_queue403.py`（12 条）与 `tests/_test_issue69_notes.py`（17 条）；全量 **50 suites / 1589 checks / 0 failed**。
+
 ## v1.5.13
 
 **✨ 新增功能**

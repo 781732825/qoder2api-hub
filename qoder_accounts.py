@@ -1256,6 +1256,8 @@ class Account(object):
         self.path = path
         self.uid = str(data.get("uid") or "")
         self.nickname = str(data.get("nickname") or "")
+        # issue #69：账号备注（纯展示，不参与任何判定）
+        self.note = str(data.get("note") or "")
         self.domain = str(data.get("domain") or "")
         self.realm = str(data.get("realm") or detect_realm_from_domain(self.domain))
         if self.realm not in REALM_CONFIGS:
@@ -1365,6 +1367,7 @@ class Account(object):
             "userType": self.user_type,
             "organizationId": self.organization_id,
             "organizationName": self.organization_name,
+            "note": self.note,
         }
 
     def public(self):
