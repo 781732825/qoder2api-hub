@@ -58,7 +58,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -8369,29 +8369,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
             return self._json(200, SCHEDULER.status() if SCHEDULER
                               else {"enabled": False, "msg": "未运行"})
-        if path == "/scheduler/config":
-            # issue #70：自定义排程（签到/保活时刻或 cron），面板内改完立即生效
-            if not self._panel_ok():
-                return self._error(401, "panel password required",
-                                   "invalid_request_error")
-            if not SCHEDULER:
-                return self._error(503, "scheduler not running",
-                                   "invalid_request_error")
-            try:
-                body = self._read_payload()
-            except Exception as exc:
-                return self._error(400, "invalid json: %s" % exc,
-                                   "invalid_request_error")
-            try:
-                st = SCHEDULER.set_schedule(
-                    checkin_times=(body or {}).get("checkin_times"),
-                    keepalive_times=(body or {}).get("keepalive_times"),
-                    cron=(body or {}).get("cron"),
-                    jitter_secs=(body or {}).get("jitter_secs"))
-            except Exception as exc:
-                return self._error(400, "schedule update failed: %s" % exc,
-                                   "invalid_request_error")
-            return self._json(200, {"ok": True, "scheduler": st})
         if path == "/settings":
             if not self._authorized():
                 return
@@ -8760,6 +8737,22 @@ class Handler(BaseHTTPRequestHandler):
                 "logs": res["logs"],
                 "accounts_count": res["accounts_count"],
             })
+        if path == "/scheduler/config":
+            # issue #70 后续：/scheduler/* 走的是账号路由前缀（is_account_route），
+            # 端点必须在这里，否则会被兜底成「unknown account endpoint」。
+            if not SCHEDULER:
+                return self._error(503, "scheduler not running",
+                                   "invalid_request_error")
+            try:
+                st = SCHEDULER.set_schedule(
+                    checkin_times=(payload or {}).get("checkin_times"),
+                    keepalive_times=(payload or {}).get("keepalive_times"),
+                    cron=(payload or {}).get("cron"),
+                    jitter_secs=(payload or {}).get("jitter_secs"))
+            except Exception as exc:
+                return self._error(400, "schedule update failed: %s" % exc,
+                                   "invalid_request_error")
+            return self._json(200, {"ok": True, "scheduler": st})
         if path == "/scheduler/trigger":
             if SCHEDULER:
                 return self._json(200, SCHEDULER.trigger_now())

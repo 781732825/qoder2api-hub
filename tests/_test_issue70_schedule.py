@@ -83,6 +83,21 @@ check("#70 POST /scheduler/config 存在", 'if path == "/scheduler/config":' in 
 _dash = open(os.path.join(ROOT, "dashboard.html"), encoding="utf-8").read()
 check("#70 面板有排程设置入口", "toggleSchedEditor" in _dash
       and "schCron" in _dash)
+# issue #70 后续：文本输入改成 24 小时刻度圆环，端点也从 /accounts 路由兜底里修出来
+check("#70 圆环渲染函数存在（点刻度选整点）",
+      all(k in _dash for k in ("renderSchedDial", "toggleSchedHour",
+                               "switchSchedMode", "_dialPath")))
+check("#70 圆环有 24 个刻度（循环 0..23）", "for(let h = 0; h < 24; h++)" in _dash)
+check("#70 保存时从圆环状态取时刻（不再手写文本）",
+      "_schedFmt(SCHED.checkin)" in _dash
+      and "_schedFmt(SCHED.keepalive)" in _dash)
+check("#70 不再依赖已删除的文本输入框", "schCheckin" not in _dash)
+_seg70 = _src.split('def _handle_accounts(self, path, payload):')[1][:6000]
+check("#70 /scheduler/config 在账号路由里处理（否则 404 unknown account endpoint）",
+      'if path == "/scheduler/config":' in _seg70)
+check("#70 旧的无路由副本已删除（全文件只出现一次 set_schedule 调用点）",
+      _src.count("SCHEDULER.set_schedule") == 1,
+      _src.count("SCHEDULER.set_schedule"))
 check("#70 状态行显示时区与下次执行",
       "时区 " in _dash and "下次 " in _dash)
 
