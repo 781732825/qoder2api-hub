@@ -1195,6 +1195,24 @@ def _opener_for_request():
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
 
 
+def upstream_clock_skew(timeout=4.0):
+    """用上游 Date 头测本机时钟漂移（秒）。无鉴权、只发 HEAD、走代理感知 opener。
+
+    issue #64：COSY 签名带时间戳，容器时钟漂移会直接 401；这是「容器里莫名失效」
+    的常见原因，必须在启动自检里看得见。失败返回 None（fail-open）。
+    """
+    from email.utils import parsedate_to_datetime
+    try:
+        req = urllib.request.Request("https://openapi.qoder.com.cn/", method="HEAD")
+        with _opener_for_request().open(req, timeout=timeout) as resp:
+            date_hdr = resp.headers.get("Date")
+        if not date_hdr:
+            return None
+        return int(parsedate_to_datetime(date_hdr).timestamp() - time.time())
+    except Exception:
+        return None
+
+
 def http_json(url, data=None, method=None, headers=None, timeout=30,
               retries=3, backoff=1.0, log=None):
     """urlopen + json decode with retries. 所有 openapi 调用统一走这里。"""

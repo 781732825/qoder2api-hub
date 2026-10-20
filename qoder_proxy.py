@@ -5211,6 +5211,46 @@ def _is_transient_transport(exc):
     return False
 
 
+# issue #64：容器运行时的自检项。COSY 签名带时间戳，容器时钟漂移会直接 401，
+# 这是「容器里莫名失效」的常见原因之一，必须在启动时看得见。
+_CLOCK_SKEW = {"seconds": None, "checked_at": 0.0}
+
+
+def _measure_clock_skew(timeout=4.0):
+    """用上游 Date 头测时钟漂移（无鉴权、只发 HEAD，结果缓存 10 分钟）。"""
+    now = time.time()
+    if _CLOCK_SKEW["seconds"] is not None and now - _CLOCK_SKEW["checked_at"] < 600:
+        return _CLOCK_SKEW["seconds"]
+    # 走 qoder_accounts 的代理感知 opener（#27：代理只认环境变量，且每请求现建），
+    # 不在这里直连——否则容器里设了 HTTPS_PROXY 也测不准、还破坏出站基线。
+    try:
+        skew = qoder_accounts.upstream_clock_skew(timeout=timeout)
+        if skew is None:
+            return None
+        _CLOCK_SKEW.update({"seconds": skew, "checked_at": now})
+        return skew
+    except Exception:
+        return None
+
+
+def env_report():
+    """容器/部署环境自检（给启动日志与 /health 用，不含凭证）。"""
+    try:
+        writable = os.access(ACCOUNTS_DIR, os.W_OK)
+    except Exception:
+        writable = False
+    ident = os.path.join(ACCOUNTS_DIR, "machine_identity.json")
+    return {
+        "container": _in_container(),
+        "proxy": bool(os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY")
+                      or os.environ.get("https_proxy") or os.environ.get("http_proxy")),
+        "accounts_writable": bool(writable),
+        "identity_cached": os.path.exists(ident),
+        "clock_skew_s": _CLOCK_SKEW["seconds"],
+        "traffic_guard": _traffic_guard_mode() or "auto",
+    }
+
+
 def _in_container():
     """是否跑在容器里（issue #57 的风控告警用，判定保守）。"""
     try:
@@ -7720,6 +7760,7 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts_ready": POOL.count_ready() if POOL else 0,
                 "api_key_required": bool(API_KEY),
                 "risk": risk_snapshot(),
+                "env": env_report(),
             }
             if self._key_ok():
                 info.update({
@@ -9430,6 +9471,27 @@ def main():
                 "rate-limit or queue the intl gateway from datacenter IPs. "
                 "Prefer a residential egress or the CN realm (issue #57)."
                 % len(_intl), level="WARN", tag="realm")
+    except Exception:
+        pass
+    # issue #64：容器/部署自检——时钟漂移会让 COSY 签名直接 401，
+    # 账户目录不可写会让设备身份无法持久（重建即换设备）。
+    try:
+        _skew = _measure_clock_skew()
+        _env = env_report()
+        log("env: container=%s proxy=%s accounts_writable=%s identity_cached=%s "
+            "clock_skew=%ss traffic_guard=%s"
+            % (_env["container"], _env["proxy"], _env["accounts_writable"],
+               _env["identity_cached"],
+               "?" if _skew is None else _skew, _env["traffic_guard"]),
+            tag="realm")
+        if _skew is not None and abs(_skew) > 120:
+            log("clock skew %ss detected: COSY signatures are time-based and will "
+                "fail with 401 - fix container time sync (issue #64)" % _skew,
+                level="WARN", tag="realm")
+        if not _env["accounts_writable"]:
+            log("accounts dir is not writable: device identity cannot persist, "
+                "container rebuild will look like a new device (issue #18)",
+                level="WARN", tag="realm")
     except Exception:
         pass
     from qoder_scheduler import Scheduler

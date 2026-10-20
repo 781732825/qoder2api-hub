@@ -72,4 +72,17 @@ check("#64 QD_TRAFFIC_GUARD=on -> 所有账号走闸门", _on is True)
 check("#64 默认并发 1、间隔 400ms（自伤防护）",
       _conc == 1 and abs(_gap - 0.4) < 1e-6, (_conc, _gap))
 
+# ---- 容器自检（时钟漂移 / 目录可写 / 身份缓存）
+_env = P.env_report()
+check("#64 env_report 覆盖容器判定与关键自检项",
+      set(["container", "proxy", "accounts_writable", "identity_cached",
+           "clock_skew_s", "traffic_guard"]) <= set(_env), sorted(_env))
+check("#64 时钟漂移测量走代理感知 opener（不新增直连 urlopen）",
+      callable(getattr(A, "upstream_clock_skew", None))
+      and "urllib.request.urlopen(" not in
+      open(os.path.join(ROOT, "qoder_accounts.py"), encoding="utf-8").read())
+check("#64 启动时会 WARN 时钟漂移与目录不可写",
+      "clock skew %ss detected" in _src
+      and "accounts dir is not writable" in _src)
+
 finish()
