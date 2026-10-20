@@ -2,6 +2,25 @@
 
 每个版本的发布说明同步在 [GitHub Releases](https://github.com/shuishuipingan/qoder2api-hub/releases)。
 
+## v1.6.0
+
+**🐛 问题修复**
+
+- **账号备注保存后 15 秒消失**（#74）：#69 只给 `to_dict()`（写文件/导出）加了 `note`，面板数据源 `public()` 漏了——保存后前端手动补一次能看见，15 秒轮询覆盖后就没了。现已补上；顺带把容器里必然出现的 `local model catalog read skipped` 从 WARN 降到 DEBUG（无官方客户端属正常降级）。
+- **残缺工具回声被吞后按 stop 收尾，coding agent 误判任务完成**（#72）：模型把工具调用退化成只有一个 18 字符标记时，旧逻辑按 #9 静默吞掉并以 `finish_reason=stop` 正常结束——agent 以为做完了，会话在长任务中途静默终止。现在**声明了 tools 且只回 marker** 时改为 fail-closed（新增 `EmptyToolEcho`，继承 `InvalidToolArguments`，四条协议出口自动复用：chat 流式 error 帧 / Responses `response.failed` / Anthropic `event: error` / 非流式 502），客户端据此重试；未声明 tools 时仍按原样丢弃（不再把孤立标记透传给用户）。截断数组维持 #9 的丢弃语义不变。
+- **信封层排队仍冷却账号、计数越界、不跨区、最终 403**（#71）：
+  - 排队（10605）在解绑会话/冷却**之前**短路：不冷却、不解绑、不判死（单号池不再被打成「no usable account」）；
+  - 日志计数改为 `min(attempt, budget)/budget`，不再出现 `try 4/3`；默认排队轮次 **6 → 3**（≈90s，现场 6 轮会被拖到 3.5 分钟）；
+  - **跨区 failover**：排队耗尽且另一区同模型有就绪账号时自动切区（尊重显式 `X-Realm`）；
+  - 排队最终统一返回 **429 + Retry-After**（按上游 `retryAfterSeconds`），不再把 403 丢给客户端。
+
+**✨ 新增功能（#70）**
+
+- **排程可配置**：签到/保活时刻改为面板可改（`09:00,21:00` / `22:00`），支持 **5 段 cron**（覆盖签到时刻）、账号间隔抖动；新增 `POST /scheduler/config`，状态里显示当前时区。
+- **排程不再漏命中**：旧实现靠「每分钟轮询 `cur_min == 0`」命中整点——容器时区与宿主机不同、或上一轮巡检跑过 1 分钟，整点就整段跳过（用户看到的就是「签到无效」）。现在改成「到点即补」：每 15s 检查是否有已过点但未触发的排程，最多回补 3 小时内的漏点。
+
+**验证**：新增 `_test_issue70_schedule.py`（21 条）、`_test_issue71_queue_envelope.py`（12 条）、`_test_issue72_empty_echo.py`（14 条）；全量 **53 suites / 1636 checks / 0 failed**。
+
 ## v1.5.14
 
 **🐛 问题修复**

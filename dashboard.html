@@ -690,9 +690,22 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <span>后台定时调度器: <b id="schedStatusText">运行中</b></span>
       <span style="color:var(--dim);font-size:11px" id="schedTimes"></span>
     </div>
-    <div style="display:flex;gap:8px">
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+      <button class="sec mini" onclick="toggleSchedEditor()">排程设置</button>
       <button class="sec mini" id="btnTriggerSched" onclick="triggerSchedulerNow(this)">立即巡检保活</button>
       <button class="sec mini" id="btnToggleSched" onclick="toggleScheduler(this)">暂停调度</button>
+    </div>
+    <div id="schedEditor" style="display:none;width:100%;gap:8px;align-items:center;flex-wrap:wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)">
+      <span style="color:var(--dim)">签到时刻</span>
+      <input id="schCheckin" placeholder="09:00,21:00" style="width:110px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font:inherit;color:var(--fg)">
+      <span style="color:var(--dim)">保活时刻</span>
+      <input id="schKeepalive" placeholder="22:00" style="width:90px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font:inherit;color:var(--fg)">
+      <span style="color:var(--dim)">cron（可选，覆盖签到时刻）</span>
+      <input id="schCron" placeholder="0 9,21 * * *" style="width:150px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font:inherit;color:var(--fg)">
+      <span style="color:var(--dim)">账号间隔抖动(s)</span>
+      <input id="schJitter" placeholder="8" style="width:60px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font:inherit;color:var(--fg)">
+      <button class="sec mini" onclick="saveSchedule(this)">保存排程</button>
+      <span style="color:var(--dim);font-size:11px">时区随时间显示在状态行；改完立即生效</span>
     </div>
   </div>
 
@@ -2180,6 +2193,32 @@ async function triggerCatTravel(btn){
   }
 }
 
+
+function toggleSchedEditor(){
+  const box = document.getElementById("schedEditor");
+  if(!box) return;
+  box.style.display = (box.style.display === "none" || !box.style.display) ? "flex" : "none";
+}
+
+async function saveSchedule(btn){
+  const g = id => (document.getElementById(id) || {}).value || "";
+  if(btn){ btn.disabled = true; btn.textContent = "保存中…"; }
+  try{
+    const r = await postJSON("/scheduler/config", {
+      checkin_times: g("schCheckin").trim(),
+      keepalive_times: g("schKeepalive").trim(),
+      cron: g("schCron").trim(),
+      jitter_secs: g("schJitter").trim(),
+    });
+    const s = r.scheduler || {};
+    toast("排程已保存：签到 " + (s.checkin_times || "-") + " · 保活 " + (s.keepalive_times || "-"), "ok");
+    loadSchedulerStatus();
+  }catch(e){
+    toast("保存失败: " + ((e && e.message) || e), "bad");
+  }finally{
+    if(btn){ btn.disabled = false; btn.textContent = "保存排程"; }
+  }
+}
 async function loadSchedulerStatus(){
   try{
     const s = await getJSON("/scheduler");
@@ -2196,7 +2235,22 @@ async function loadSchedulerStatus(){
       ? (s.mode_intl || '账号 Token 自动保活与凭证常驻 (每日 22:00 集中巡检)')
       : (s.mode_cn || s.mode || '整点排程');
     if(txt) txt.textContent = s.enabled ? ('运行中 · ' + modeText) : '已暂停';
-    if(times) times.textContent = '上次: ' + (s.last_run_time || '-') + ' · 下次: ' + (s.next_run_time || '-');
+    if(times){
+      // issue #70：把排程时刻与时区摆出来——容器跑 UTC 时一眼能看出对不上
+      times.textContent = '签到 ' + (s.checkin_times || '-')
+        + ' · 保活 ' + (s.keepalive_times || '-')
+        + (s.cron ? (' · cron ' + s.cron) : '')
+        + ' · 时区 ' + (s.timezone || '-')
+        + ' · 上次 ' + (s.last_run_time || '-')
+        + ' · 下次 ' + (s.next_run_time || '-');
+      const ci = document.getElementById('schCheckin');
+      const ki = document.getElementById('schKeepalive');
+      const cr = document.getElementById('schCron');
+      const jt = document.getElementById('schJitter');
+      if(ci && !ci.value) ci.value = s.checkin_times || '';
+      if(ki && !ki.value) ki.value = s.keepalive_times || '';
+      if(jt && !jt.value) jt.value = s.jitter_secs != null ? String(s.jitter_secs) : '';
+    }
     if(btn) btn.textContent = s.enabled ? '暂停调度' : '启用调度';
     // 按钮文案固定「立即巡检保活」：巡检同时覆盖两个区域（保活+签到+积分），
   // 按当前视图改文案只会让人以为「切区后动作不同」。
