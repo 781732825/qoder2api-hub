@@ -1777,7 +1777,12 @@ class Account(object):
         return {
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
-            "User-Agent": CLIENT_UA,
+            # UA 必须与所属区域的官方客户端一致。此前这里用全局 CLIENT_UA
+            # （Go 语言 HTTP 客户端的默认值 "Go-http-client/2.0"），而 Qoder
+            # 官方客户端是 Electron/Node 应用，绝不可能发出这个 UA —— 等于在
+            # 每个 openapi 请求上自报「我是脚本」。REALM_CONFIGS 里本来就有
+            # 官方 UA（CN: QoderWork/1.1.64，INTL: Qoder/1.1.64），直接用。
+            "User-Agent": cfg.get("ua") or CLIENT_UA,
             "Authorization": "Bearer " + self.access_token,
             "X-Request-ID": generate_request_id(self.uid),
             "X-Machine-ID": derive_id(self.uid, "machine"),
@@ -1882,7 +1887,8 @@ class Account(object):
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
-            "User-Agent": CLIENT_UA,
+            # 与 headers() 同口径：token 刷新同样要发官方客户端 UA。
+            "User-Agent": get_realm_config(self.realm).get("ua") or CLIENT_UA,
         }
         try:
             data = http_json(url, data=json.dumps(payload).encode(), method="POST",
@@ -3657,7 +3663,7 @@ class AccountPool(object):
             # URL 校验由 http_json 内部执行、失败仍由外层 except 兜底。
             ui = http_json(ui_url, method="GET", headers={
                 "Accept": "application/json",
-                "User-Agent": CLIENT_UA,
+                "User-Agent": cfg.get("ua") or CLIENT_UA,
                 "Authorization": "Bearer " + token,
             }, timeout=15, retries=1)
             uid = str(ui.get("id") or uid)
@@ -3704,7 +3710,7 @@ class AccountPool(object):
                          method="POST",
                          headers={"Content-Type": "application/json",
                                   "Accept": "application/json",
-                                  "User-Agent": CLIENT_UA},
+                                  "User-Agent": cfg.get("ua") or CLIENT_UA},
                          timeout=30)
         token = data.get("token") or ""
         if not token:
@@ -3713,7 +3719,7 @@ class AccountPool(object):
         try:
             ui = http_json(cfg["openapi"] + PATH_USERINFO, method="GET",
                            headers={"Accept": "application/json",
-                                    "User-Agent": CLIENT_UA,
+                                    "User-Agent": cfg.get("ua") or CLIENT_UA,
                                     "Authorization": "Bearer " + token},
                            timeout=15, retries=2)
             uid = str(ui.get("id") or "")
