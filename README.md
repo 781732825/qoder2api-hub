@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.9-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.10-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -517,6 +517,35 @@ python _verify_models.py --base http://127.0.0.1:8790
 - 席位被回收、token 被重置（反代立即失效）；
 - 把公司席位共享给组织外的人（额度、审计、条款三条都会踩线）；
 - 数据中心出口访问**国际版**容易被风控（见 #57 的容器告警）。
+
+### v1.5.10
+
+**✨ 新增功能**
+
+- **流量守卫（对所有账号生效）**：`QD_TRAFFIC_GUARD=on` 把 #56 的团队闸门扩展到全部账号——
+  单号并发默认 **1**、最小间隔 **400ms**，避免「自己把号打到并发过高」触发限流；
+  可调 `QD_TEAM_MAX_CONCURRENCY` / `QD_TEAM_MIN_GAP_MS` / `QD_TEAM_WAIT_SECS`。
+- **风控遥测**：`GET /health` 新增 `risk` 字段（`queue / rate / rejected / version_gate` + 最近一次信号），
+  `scripts/risk_diag.py` 只读诊断账号健康、生效旋钮、容器+intl 告警与日志信号。
+
+**🐛 问题修复**
+
+- **intl 出口顺序对齐官方**（逆向 intl 客户端 endpoint 缓存）：推理主 `api3.qoder.sh`，备 `api2` / `api1`；
+  旧配置以 api1 为主，而官方 0.4.8 候选首位早已是 api3（本机实测 api1 常年超时）。`QD_INTL_GATEWAY` 可覆盖。
+- **推理头补齐官方形态**：sse 请求新增 `cosy-machineos` 与 `cosy-machinehostname`（后者官方仅 infer-sse 携带，
+  按账号稳定派生、跨账号不同）；`QD_COSY_OS_HEADERS=0` 可关。
+- **排队不再换号**：10605 是模型级队列，换号不会变快；现在排队时**不解绑会话亲和**，
+  避免「同一会话在多账号间跳」的异常画像。
+- **430 版本门可读化**：返回「客户端/网关版本过低，请升级」，不再被误判成风控或账号问题。
+
+**📚 文档**
+
+- `docs/risk-control-and-queueing.md`：风控维度、处置等级、多账号为何排队、官方客户端逆向结论
+  （排队轮询协议 `/api/v2/service/ask/queue/status`、60 分钟默认等待、UMID 设备身份、错误码表）、intl/cn 差异。
+- `docs/risk-control-playbook.md`：分层处方（出口 > 身份 > 调度 > 请求 > 观测 > 应急）、
+  容器/数据中心三种落地方案、**只做软件层时能控什么**、P0/P1/P2 路线与验收指标。
+
+**验证**：全量 **43 suites / 1478 checks / 0 failed**。
 
 ### v1.5.9
 
