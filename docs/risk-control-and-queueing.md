@@ -116,3 +116,70 @@
 容器+intl ──> 启动 WARN ──> 换住宅出口或改 cn
 多账号   ──> 只分摊额度/并发，不增加队列容量
 ```
+---
+
+## 7. 官方客户端实测（逆向 `qoderclicn.exe` + `app.asar`）
+
+> 方法：本机安装的 **Qoder CN 桌面端**（`AppData/Local/Programs/Qoder CN`）+ CLI core
+> `%USERPROFILE%\.qodersec\bin\qoderclicn.exe`，只读字符串常量与调用链，未修改任何文件。
+
+### 7.1 排队是**独立的轮询协议**，不是「失败后重试」
+
+```
+GET /api/v2/service/ask/queue/status?requestSetId=<id>&modelKey=<key>&queueType=<type>
+```
+
+- 首次请求被拒（`10605` / `isQueued:true`）后，客户端**不结束请求**，进入轮询循环；
+- 每轮先 `sleep(retryAfterSeconds)`（取自错误体 `queue.retryAfterSeconds`），再查一次状态；
+- `isQueued === false` → 继续真正的推理请求；
+- `serviceAvailable === false` → **继续轮询**（暂时无容量，不放弃）；
+- 连续 **3 次**轮询失败 → 判致命（`Ok0=3`）；
+- **总等待上限默认 60 分钟**（`3600000ms`），可用 `QODER_MODEL_QUEUE_MAX_WAIT_MS` 覆盖；
+- 状态以 `system / model_queue_status` 事件流式回给客户端（`queue_count`、`wait_time_ms`、
+  `queue_wait_elapsed_ms`、`queue_max_wait_ms`、`service_available`），UI 显示「模型负载较高」，
+  给 **切换模型分级 / 重试** 两个动作。
+
+**结论**：官方对排队是**分钟级耐心等待**，不是秒级失败。我们此前 300s 预算偏短。
+
+### 7.2 身份头（官方实际发送）
+
+| 场景 | 头 |
+|---|---|
+| 推理 SSE（`infer-sse`） | `Cosy-Version`、`Cosy-ClientType`、`Cosy-MachineOS`、**`Cosy-MachineHostname`（仅此场景）** |
+| 中心/反馈 API | `X-Request-Id`、`X-IDE-Platform: qoder_cli`、`X-Version`、`X-Machine-OS`、`X-Machine-Id`、`X-Machine-Type`、`X-Machine-Code` |
+
+本仓 COSY 头已覆盖 `cosy-machineid / machinetoken / machinetype / date / key / user / version / clienttype`，
+与官方推理路径一致；差别只在 `Cosy-MachineHostname` 与少数 trace 头。
+
+### 7.3 设备身份由原生 SDK 计算
+
+- `resources/umid/` 内有 `sgsdk.dll` + `runtime-info.exe`（阿里 UMID 设备指纹）；
+- 主进程按**账号**调用 `runtime-info.exe --account-stdin` 计算身份，函数名里带
+  `NATIVE_RISK_IDENTITY_ABORTED` —— 即「原生风险身份」；
+- 另有 `auth.machine-id`（本地持久化 UUID）作为机器标识。
+
+**含义**：设备身份是**每账号一份、由官方 SDK 计算**。本仓派生稳定身份在「不被判成爬虫」这层有效，
+但**不会**让上游认为你是官方客户端；行为异常（高频、多 IP、超大请求）仍会被风控。
+
+### 7.4 客户端会专门渲染的错误码
+
+`103 / 105 / 110 / 112 / 114 / 115 / 116 / 117 / 118 / 119 / 122 / 406 / 430 / 10605 / 80411 / 80412 / 100400 / 100401 / 100403`
+
+与我们直接相关的：
+
+- `10605` → 模型负载较高（排队）；
+- `114` → 试用账户使用受限；
+- `430` → **版本过低**（要求升级客户端）；
+- `100401 / 100403` → 鉴权/权限拒绝。
+
+### 7.5 重试策略（官方）
+
+底层 HTTP（undici RetryHandler）对 `429 / 500 / 502 / 503 / 504` 与
+`ECONNRESET / EPIPE / UND_ERR_SOCKET` 自动重试；排队走 7.1 的轮询协议。
+
+### 7.6 由此得到的两个直接改进
+
+1. **等待预算对齐官方**：网关默认从「3 轮 × 30s ≈ 90s」提升到**分钟级**
+   （`QD_QUEUE_MAX_ROUNDS` 默认 6、`QD_QUEUE_WAIT_BUDGET_SECS` 默认 600），并加 0~2s 抖动，
+   避免多客户端同时唤醒打同一队列；
+2. **可见性**：等待期间日志明确写「第 N 轮 / 已等 Xs」，客户端侧表现为「慢」而不是「403」。

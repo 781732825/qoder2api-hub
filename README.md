@@ -547,6 +547,29 @@ python _verify_models.py --base http://127.0.0.1:8790
 
 **验证**：全量 **42 suites / 1436 checks / 0 failed**（新增 `_test_issue56_62.py` 25 条）。
 
+### v1.5.7
+
+**📚 文档**
+
+- 新增 **`docs/risk-control-and-queueing.md`**：Qoder 国际版风控与排队的完整观察笔记——
+  上游看到的维度（客户端指纹 / 设备身份 / 账号 / 网络 / 行为）、处置等级（10605 排队、403、429、
+  418、内容审核）、多账号为什么仍会排队、分层缓解办法与反模式。
+- 含对**官方桌面端**（`qoderclicn.exe` / `app.asar`）的只读逆向结论：
+  - 排队走**独立轮询协议** `GET /api/v2/service/ask/queue/status?requestSetId&modelKey&queueType`，
+    每轮 sleep `retryAfterSeconds`，`isQueued=false` 才继续，`serviceAvailable=false` 继续轮询，
+    连续 3 次失败判致命，**总等待默认 60 分钟**（`QODER_MODEL_QUEUE_MAX_WAIT_MS`）；
+  - 官方推理头为 `Cosy-Version / Cosy-ClientType / Cosy-MachineOS / Cosy-MachineHostname`（仅 infer-sse）；
+  - 设备身份由原生 SDK 计算（`resources/umid/sgsdk.dll` + `runtime-info.exe`，函数名含 `NATIVE_RISK_IDENTITY`）；
+  - 客户端专门渲染的错误码：`10605 / 114 / 430 / 100401 / 100403 / 80411 …`。
+
+**⚙️ 行为调整（排队预算对齐官方）**
+
+- 网关排队等待从「3 轮 × 30s ≈ 90s」提升到**分钟级**：`QD_QUEUE_MAX_ROUNDS` 默认 **6**、
+  `QD_QUEUE_WAIT_BUDGET_SECS` 默认 **600**（10 分钟），单轮仍受 `QD_QUEUE_WAIT_MAX_SECS`（180s）约束；
+- 每次等待加 **0~2s 抖动**（`QD_QUEUE_WAIT_JITTER`），避免多客户端同时唤醒一起打同一队列。
+
+**验证**：全量 **42 suites / 1443 checks / 0 failed**。
+
 ### v1.5.6
 
 **🐛 问题修复**

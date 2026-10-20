@@ -5091,9 +5091,14 @@ TRANSIENT_MAX_RETRIES = 2          # 同账号额外重试次数（1s、2s 退�
 # 它当成请求被拒（直接结束本轮）。三档都是可调的，默认值保守：
 #   单轮最长等 QUEUE_WAIT_MAX_SECS；整次请求总预算 QUEUE_WAIT_BUDGET_SECS；
 #   最多等 QUEUE_MAX_ROUNDS 轮。超出预算仍按原错误返回（fail-open 语义不变）。
-QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 3)
+# issue #57 后续（逆向官方客户端）：官方排队是**独立轮询协议**，总等待默认 60 分钟
+# （QODER_MODEL_QUEUE_MAX_WAIT_MS=3600000），每轮 sleep retryAfterSeconds。
+# 网关是同步 HTTP，不能真等 60 分钟；这里给分钟级预算（默认 10 分钟 / 6 轮），
+# 仍可用 QD_QUEUE_* 覆盖。
+QUEUE_MAX_ROUNDS = int(os.environ.get("QD_QUEUE_MAX_ROUNDS") or 6)
 QUEUE_WAIT_MAX_SECS = int(os.environ.get("QD_QUEUE_WAIT_MAX_SECS") or 180)
-QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 300)
+QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 600)
+QUEUE_WAIT_JITTER_SECS = float(os.environ.get("QD_QUEUE_WAIT_JITTER") or 2.0)
 
 
 def _queue_wait_seconds(detail):
@@ -5770,7 +5775,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                         "(round %d/%d)"
                         % (account.uid[:8], model, qwait, queue_tries,
                            QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
-                    time.sleep(qwait + 1)
+                    # 抖动 0~2s：多客户端同时被唤醒会一起打同一队列
+                    time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
                     continue
                 # 429/401/403 与客户端参数错：立即进入分类，不重试
                 if exc.code in (429, 401, 403):
