@@ -5260,6 +5260,10 @@ def friendly_upstream_error(code, detail):
         code_i = int(code)
     except Exception:
         code_i = 502
+    # issue #64：版本过低是硬门控（官方客户端会自己升级，网关只能提示）
+    if "430" in str(code):
+        return ("客户端/网关版本过低（430）：上游要求升级后才能继续。"
+                "请升级到最新版；这不是账号或网络问题。", "version_too_low")
     # issue #59：出站体积超限（本地拦下，没发出去）\n    if "payload too large" in detail:\n        return ("请求体过大（超过上游 30MB 限制）：网关已在本地拦下、未发送。"\n                "请减少图片数量/尺寸（或改用更小的图）后重试。详情：%s"\n                % detail[:160], "payload_too_large")\n    # issue #38/#51：上游排队 / 资源不足（10605 RESOURCE_LIMIT）
     if "10605" in detail or "isQueued" in detail or "RESOURCE_LIMIT" in detail:
         return ("上游排队中（10605 / RESOURCE_LIMIT）：已按 retryAfterSeconds 等待并重试，"
@@ -5547,7 +5551,28 @@ def _is_team_account(account):
     return False
 
 
+def _traffic_guard_mode():
+    """issue #64：把「团队账号并发闸门」扩展成**对所有账号**生效的流量守卫。
+
+    出口/IP 我们控制不了，但「自己把某个号打到并发过高/节奏异常」是能控的：
+    - on   ：所有账号都走闸门（推荐给 intl / 数据中心出口场景）
+    - off  ：全部关闭
+    - 未设置：保持旧行为（只对团队账号生效）
+    """
+    raw = str(os.environ.get("QD_TRAFFIC_GUARD") or "").strip().lower()
+    if raw in ("1", "on", "true", "yes", "enable", "enabled"):
+        return "on"
+    if raw in ("0", "off", "false", "no", "disable", "disabled"):
+        return "off"
+    return ""
+
+
 def _team_guard_on(account):
+    forced = _traffic_guard_mode()
+    if forced == "on":
+        return True
+    if forced == "off":
+        return False
     mode = _team_guard_mode()
     if mode == "off":
         return False
@@ -5883,11 +5908,13 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 last_429_detail = detail
                 continue
             if exc.code in (401, 403):
-                note_risk("queue" if _queue_wait_seconds(detail) else "rejected",
-                          detail)
+                _is_queue_http = bool(_queue_wait_seconds(detail))
+                note_risk("queue" if _is_queue_http else "rejected", detail)
                 log("account %s rejected (HTTP %s), rotating"
                     % (account.uid[:8], exc.code))
-                if session_key and POOL:
+                # issue #64：排队(10605)不解绑会话亲和——排队是模型级的，换号
+                # 不会变快，反而造成「同会话在多账号间跳」的异常画像。
+                if session_key and POOL and not _is_queue_http:
                     POOL.affinity.unbind(session_key)
                 dead = qoder_accounts.session_dead(detail)
                 account.note_error("HTTP %s %s" % (exc.code, detail[:80]),

@@ -58,4 +58,18 @@ check("#64 risk 记录最近一次信号（kind/at/detail）",
 _src = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
 check("#64 /health 暴露 risk 快照", '"risk": risk_snapshot()' in _src)
 
+# ---- 流量守卫：把「团队并发闸门」扩展到所有账号
+_acc = A.Account({"uid": "guard-u", "realm": "cn", "accessToken": "t"})
+check("#64 默认不强制（非团队账号不闸）", P._team_guard_on(_acc) is False)
+os.environ["QD_TRAFFIC_GUARD"] = "on"
+try:
+    _on = P._team_guard_on(_acc)
+    _conc = P._team_max_concurrency()
+    _gap = P._team_min_gap()
+finally:
+    os.environ.pop("QD_TRAFFIC_GUARD", None)
+check("#64 QD_TRAFFIC_GUARD=on -> 所有账号走闸门", _on is True)
+check("#64 默认并发 1、间隔 400ms（自伤防护）",
+      _conc == 1 and abs(_gap - 0.4) < 1e-6, (_conc, _gap))
+
 finish()
