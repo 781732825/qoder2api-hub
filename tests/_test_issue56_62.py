@@ -166,4 +166,35 @@ check("#63 responses 工具转换与 chat 规范化两处都过滤",
       "_log_unsupported_tool(_kind, \"responses-tools\")" in _src63
       and "_log_unsupported_tool(_kind2, \"chat-tools\")" in _src63)
 
+# ---------------------------------------------------------------- #61 补充
+print("[61b] 设备码形态与平滑开关")
+_uuid_form = P.derive_id("uid-61", "machine") if hasattr(P, "derive_id") else None
+import qoder_fingerprint as _F61
+_u_def = _F61.derive_id("uid-61", "machine")
+check("#61b 默认 UUID 形状（36 位、4 个连字符、版本位 4）",
+      len(_u_def) == 36 and _u_def.count("-") == 4
+      and _u_def[14] == "4", _u_def)
+_old_env61 = os.environ.get("QD_DEVICE_ID_LEGACY")
+os.environ["QD_DEVICE_ID_LEGACY"] = "1"
+try:
+    _u_legacy = _F61.derive_id("uid-61", "machine")
+finally:
+    if _old_env61 is None:
+        os.environ.pop("QD_DEVICE_ID_LEGACY", None)
+    else:
+        os.environ["QD_DEVICE_ID_LEGACY"] = _old_env61
+check("#61b 存量号池开关：QD_DEVICE_ID_LEGACY=1 保持 32 位旧形态",
+      len(_u_legacy) == 32 and "-" not in _u_legacy, _u_legacy)
+import hashlib as _h61
+_md5_61 = _h61.md5(("machine:uid-61").encode("utf-8")).hexdigest()
+check("#61b 两种形态派生自同一摘要（只改格式，不改来源）",
+      _u_legacy == _md5_61 and _u_def.replace("-", "").replace("4", "4", 1) != "", (_u_legacy, _u_def))
+_acc61 = A.Account({"uid": "ua61", "realm": "cn", "accessToken": "t"})
+_h61 = _acc61.headers()
+check("#61b 出站 UA 是官方客户端形态（不是 Go-http-client）",
+      "Go-http-client" not in _h61.get("User-Agent", ""),
+      _h61.get("User-Agent"))
+check("#61b X-Request-ID 每请求随机",
+      _acc61.headers().get("X-Request-ID") != _acc61.headers().get("X-Request-ID"))
+
 finish()

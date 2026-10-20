@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.8-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.9-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -517,6 +517,20 @@ python _verify_models.py --base http://127.0.0.1:8790
 - 席位被回收、token 被重置（反代立即失效）；
 - 把公司席位共享给组织外的人（额度、审计、条款三条都会踩线）；
 - 数据中心出口访问**国际版**容易被风控（见 #57 的容器告警）。
+
+### v1.5.9
+
+**🐛 问题修复 / 防风控对齐（PR #61 by ddddd-ren）**
+
+三处出站身份形态与官方客户端对不上，都可被动聚类成「网关特征」：
+
+- **出站 UA**：此前是 `Go-http-client/2.0`（Go 语言 HTTP 客户端默认值），而 Qoder 官方客户端是 Electron/Node 应用——等于每个请求自报「我是脚本」。现在按区域取官方 UA（CN `QoderWork/1.1.64` / INTL `Qoder/1.1.64`），覆盖 `headers()`、token 刷新、设备授权取 userinfo、PAT 导入的 jobToken 交换。
+- **请求 ID**：`X-Request-ID` 此前是「uid 派生的固定前缀 + 微秒」，那个前缀是**每个请求都在的稳定标记**。现在改为每请求纯随机 32 位 hex。
+- **设备码形态**：`derive_id` 从「32 位无连字符 hex」改为 **UUIDv4 形状**（与官方 machineId 同形），派生来源（uid+salt 加盐哈希）不变、同账号恒定、跨账号隔离。
+
+**⚠️ 存量号池注意**：设备码形态变化意味着上游会把每个已入池账号看成「换了一台设备」。想避免这次换设备，升级前设置 `QD_DEVICE_ID_LEGACY=1`（保持旧 32 位 hex 形态；该开关只影响格式，不影响派生来源）。新号池不需要。
+
+**验证**：全量 **42 suites / 1460+ checks / 0 failed**（PR 自带 17 条 + 本地补 5 条形态/开关断言）。
 
 ### v1.5.8
 

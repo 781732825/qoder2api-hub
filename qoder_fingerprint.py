@@ -28,6 +28,18 @@ import time
 import uuid
 
 
+def _device_id_legacy() -> bool:
+    """QD_DEVICE_ID_LEGACY=1 时保留旧的「32 位无连字符 hex」形态。
+
+    issue #61 把设备码改成 UUID 形状对齐官方客户端，代价是**存量账号的
+    machineId/sessionId 会变**（对上游等于换了一台设备）。已经稳定跑着的号池
+    如果想避免这次「换设备」，升级前设这个开关即可保持旧值不变。
+    新号池不需要它（默认 UUID 形状更接近官方）。
+    """
+    raw = str(os.environ.get("QD_DEVICE_ID_LEGACY") or "").strip().lower()
+    return raw in ("1", "on", "true", "yes", "enable", "enabled")
+
+
 def derive_id(uid: str, salt: str) -> str:
     """由 uid + salt 稳定派生一个**带连字符的 UUID 形状**设备/会话标识。
 
@@ -42,6 +54,8 @@ def derive_id(uid: str, salt: str) -> str:
     """
     seed = f"{salt}:{uid or 'anonymous'}"
     h = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    if _device_id_legacy():
+        return h            # 旧形态：32 位无连字符 hex（存量号池平滑用）
     # 伪造 UUIDv4 的版本位（第 13 位）与变体位（第 17 位），与官方同形。
     h = h[:12] + "4" + h[13:16] + "a" + h[17:]
     return "%s-%s-%s-%s-%s" % (h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
