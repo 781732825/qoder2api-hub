@@ -136,4 +136,34 @@ check("#56 开关可关：QD_TEAM_GUARD=off",
                 P._team_guard_on(_team),
                 os.environ.pop("QD_TEAM_GUARD", None))[1])() is False)
 
+# ---------------------------------------------------------------- #63
+print("[63] 未知工具类型过滤")
+_TOOLS = [
+    {"type": "function", "function": {"name": "shell", "parameters": {}}},
+    {"type": "custom", "name": "freeform", "description": "x"},
+    {"type": "namespace", "name": "mcp", "tools": [{"type": "function"}]},
+    {"type": "web_search"},
+]
+_out = P._tools_for_chat(_TOOLS)
+check("#63 function 原样保留",
+      any((t.get("function") or {}).get("name") == "shell" for t in _out))
+check("#63 custom 仍按原逻辑降级为 function",
+      any(t.get("name") == "freeform" and t.get("type") == "function"
+          for t in _out))
+check("#63 namespace / web_search 被丢弃（不再透传给上游）",
+      all(t.get("type") in (None, "function") for t in _out)
+      and len(_out) == 2, [t.get("type") for t in _out])
+check("#63 丢弃时记了告警（按类型）",
+      "namespace" in P._UNSUPPORTED_TOOL_LOG
+      and "web_search" in P._UNSUPPORTED_TOOL_LOG)
+_obj63 = {"tools": list(_TOOLS)}
+P.normalize_tools(_obj63)
+check("#63 normalize_tools 同样过滤未知类型",
+      all(t.get("type") in (None, "function") for t in _obj63["tools"]),
+      [t.get("type") for t in _obj63["tools"]])
+_src63 = open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
+check("#63 responses 工具转换与 chat 规范化两处都过滤",
+      "_log_unsupported_tool(_kind, \"responses-tools\")" in _src63
+      and "_log_unsupported_tool(_kind2, \"chat-tools\")" in _src63)
+
 finish()

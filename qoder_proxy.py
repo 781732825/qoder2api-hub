@@ -57,7 +57,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates, CLIENT_UA,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.5.7"
+VERSION = "1.5.8"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -3205,6 +3205,12 @@ def normalize_tools(obj):
     norm = []
     for t in tools:
         if not isinstance(t, dict):
+            continue
+        _kind2 = t.get("type")
+        if _kind2 not in (None, "function"):
+            # issue #63：namespace / web_search 等类型 Qoder 无法表达，
+            # 透传会导致上游 400（unknown variant）。丢弃并告警。
+            _log_unsupported_tool(_kind2, "chat-tools")
             continue
         if "name" in t and "function" not in t and t.get("type") == "function":
             fn = {
@@ -6373,6 +6379,20 @@ CUSTOM_TOOL_HINT = (
 )
 
 
+_UNSUPPORTED_TOOL_LOG = {}
+
+
+def _log_unsupported_tool(kind, where="tools"):
+    """未知工具类型被丢弃时记一次 WARN（同类每 10 分钟一条，issue #63）。"""
+    key = str(kind or "?")
+    now = time.time()
+    if now - _UNSUPPORTED_TOOL_LOG.get(key, 0) < 600:
+        return
+    _UNSUPPORTED_TOOL_LOG[key] = now
+    log("dropped unsupported tool type %r at %s - Qoder upstream only accepts "
+        '"function" (issue #63)' % (key, where), level="WARN", tag="chat")
+
+
 def _is_custom_tool(tool):
     return isinstance(tool, dict) and str(tool.get("type") or "").lower() == "custom"
 
@@ -6413,12 +6433,25 @@ def _downgrade_custom_tool(tool):
 
 
 def _tools_for_chat(tools):
-    """Downgrade custom tools; leave everything else untouched."""
+    """只保留 Qoder 上游能表达的工具（issue #63）。
+
+    Codex / MCP 会发 `type: "namespace"`、`web_search` 这类 Responses 专有工具；
+    原样透传会让上游在反序列化阶段 400（`unknown variant namespace, expected
+    function`），整个回合失败。这里把它们丢掉并记一次告警——function 工具不受
+    影响，custom 仍按原逻辑降级。
+    """
     out = []
     for t in tools or []:
         if not isinstance(t, dict):
             continue
-        out.append(_downgrade_custom_tool(t) if _is_custom_tool(t) else t)
+        if _is_custom_tool(t):
+            out.append(_downgrade_custom_tool(t))
+            continue
+        _kind = t.get("type")
+        if _kind in (None, "function"):
+            out.append(t)
+            continue
+        _log_unsupported_tool(_kind, "responses-tools")
     return out
 
 

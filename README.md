@@ -1,7 +1,7 @@
 # Qoder2API-Hub — 国际版、国内版多账号网关中枢
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v1.5.7-2496ED?style=flat-square" alt="Version 1.3.7">
+  <img src="https://img.shields.io/badge/Release-v1.5.8-2496ED?style=flat-square" alt="Version 1.3.7">
   <img src="https://img.shields.io/badge/Python-3.9+-blue.svg?style=flat-square" alt="Python">
   <img src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square" alt="OpenAI API">
   <img src="https://img.shields.io/badge/Dual_Realm-CN_&_Intl-0DBD8B?style=flat-square" alt="Dual Realm">
@@ -517,6 +517,16 @@ python _verify_models.py --base http://127.0.0.1:8790
 - 席位被回收、token 被重置（反代立即失效）；
 - 把公司席位共享给组织外的人（额度、审计、条款三条都会踩线）；
 - 数据中心出口访问**国际版**容易被风控（见 #57 的容器告警）。
+
+### v1.5.8
+
+**🐛 问题修复**
+
+- **Codex / MCP 的 `namespace` 工具导致上游 400**（#63）：Codex 会在 `/v1/responses` 的工具列表里发 `type: "namespace"`（MCP / multi-agent）与 `web_search` 这类 Responses 专有类型。网关原样透传给 Qoder，上游反序列化阶段直接报 `unknown variant \`namespace\`, expected \`function\`` → 整个回合失败（稳定复现，不是网络抖动）。
+  现在两处都做过滤：`_tools_for_chat()`（Responses→Chat 转换）与 `normalize_tools()`（Chat 请求规范化）只保留 `function` 与已降级的 `custom`，其余类型丢弃并记一条**按类型节流**的 WARN（同类每 10 分钟一条）。`function` 工具与 custom 降级逻辑完全不变。
+  注：namespace/MCP 工具本身**仍不会被调用**——上游无法表达它们。要完整支持需要 namespace 拍平 + 响应端还原，属于后续特性。
+
+**验证**：全量 **42 suites / 1442 checks / 0 failed**（`_test_issue56_62.py` 扩到 31 条，覆盖工具过滤与告警）。
 
 ### v1.5.7
 
