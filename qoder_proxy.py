@@ -5101,6 +5101,34 @@ QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 600)
 QUEUE_WAIT_JITTER_SECS = float(os.environ.get("QD_QUEUE_WAIT_JITTER") or 2.0)
 
 
+# issue #64：风控/排队信号计数（只读观测，供 /health 与面板排查）。
+RISK_STATS = {"queue": 0, "rate": 0, "rejected": 0, "version_gate": 0,
+              "last": None}
+_RISK_LOCK = threading.Lock()
+
+
+def note_risk(kind, detail=""):
+    """记一次风控/排队信号（queue/rate/rejected/version_gate）。"""
+    try:
+        with _RISK_LOCK:
+            if kind in RISK_STATS:
+                RISK_STATS[kind] = int(RISK_STATS[kind]) + 1
+            RISK_STATS["last"] = {
+                "kind": kind,
+                "at": time.strftime("%m-%d %H:%M:%S"),
+                "detail": str(detail or "")[:120],
+            }
+    except Exception:
+        pass
+
+
+def risk_snapshot():
+    """给 /health 用的快照（不阻塞、不含凭证）。"""
+    with _RISK_LOCK:
+        return {k: (dict(v) if isinstance(v, dict) else v)
+                for k, v in RISK_STATS.items()}
+
+
 def _queue_wait_seconds(detail):
     """从上游 403/排队响应体里解析「等多久」；不是排队信号则返回 0。
 
@@ -5304,6 +5332,7 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
         dead = qoder_accounts.session_dead(detail)
         # 10605 排队冷却为模型级或账号级
         is_queue = "10605" in detail or "isQueued" in detail
+        note_risk("queue" if is_queue else "rejected", detail)
         cd = 300 if dead else (retry_secs if is_queue else 60)
         actual = account.note_error("envelope HTTP %s: %s"
                                     % (status_int, detail[:80]),
@@ -5838,6 +5867,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
         # ---- 错误分类（与原有轮换语义一致） ----
         if isinstance(exc, urllib.error.HTTPError):
             if exc.code == 429:
+                note_risk("rate", detail)
                 account.note_error("HTTP 429 (model throttled)", model=model,
                                    cooldown=60)
                 # task-74 三族之一：账号级软限流退避（连续才涨；单号池不接，
@@ -5853,6 +5883,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 last_429_detail = detail
                 continue
             if exc.code in (401, 403):
+                note_risk("queue" if _queue_wait_seconds(detail) else "rejected",
+                          detail)
                 log("account %s rejected (HTTP %s), rotating"
                     % (account.uid[:8], exc.code))
                 if session_key and POOL:
@@ -7660,6 +7692,7 @@ class Handler(BaseHTTPRequestHandler):
                 "accounts": len(POOL.accounts) if POOL else 0,
                 "accounts_ready": POOL.count_ready() if POOL else 0,
                 "api_key_required": bool(API_KEY),
+                "risk": risk_snapshot(),
             }
             if self._key_ok():
                 info.update({
