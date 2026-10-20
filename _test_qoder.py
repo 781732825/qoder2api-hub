@@ -1642,11 +1642,13 @@ check("daily row carries a jump url (campaignUrl or activities page)",
       _intl_row.get("jump_url"))
 
 print()
-print("[19] gateway host failover (official intl api1 -> api2; CN single host)")
-check("gateway_candidates: intl primary is api1 with api2/api3 fallbacks",
-      A.gateway_candidates("intl") == ["https://api1.qoder.sh",
+print("[19] gateway host failover (official intl api3 -> api2/api1; CN single host)")
+# issue #64：官方 0.4.8 的 endpoint 缓存里 inference=api3、securityInference=api2，
+# api1 已不是候选首位（本机实测也常年超时）。断言随官方顺序更新。
+check("gateway_candidates: intl primary is api3 with api2/api1 fallbacks",
+      A.gateway_candidates("intl") == ["https://api3.qoder.sh",
                                        "https://api2.qoder.sh",
-                                       "https://api3.qoder.sh"],
+                                       "https://api1.qoder.sh"],
       A.gateway_candidates("intl"))
 check("gateway_candidates: cn has a single official host",
       A.gateway_candidates("cn") == ["https://gateway.qoder.com.cn"],
@@ -1670,7 +1672,8 @@ class _Resp19(object):
 
 def _fake_urlopen19(req, timeout=None):
     _hits19.append(req.full_url)
-    if "api1.qoder.sh" in req.full_url:
+    # issue #64：官方顺序已改为 api3 主、api2 备 → 让主 host 失败，验证切到 api2。
+    if "api3.qoder.sh" in req.full_url:
         raise _ssl19.SSLError("simulated TLS EOF on primary host")
     return _Resp19()
 
@@ -1696,8 +1699,8 @@ finally:
 
 check("failover: request succeeded after primary host transport error",
       _err19 is None and _acc19.uid == "h19", _err19)
-check("failover: both hosts were tried in order (api1 then api2)",
-      len(_hits19) == 2 and "api1.qoder.sh" in _hits19[0]
+check("failover: both hosts were tried in order (api3 then api2)",
+      len(_hits19) == 2 and "api3.qoder.sh" in _hits19[0]
       and "api2.qoder.sh" in _hits19[1], _hits19)
 check("failover: signature path unchanged across hosts",
       _hits19[0].split("?")[0].endswith(P.CHAT_PATH.split("?")[0]),

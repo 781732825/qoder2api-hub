@@ -61,8 +61,13 @@ REALM_CONFIGS = {
         "openapi": "https://openapi.qoder.sh",
         # 推理主机取自 0.4.3 客户端的 endpoint 缓存/内置候选（api1 主选，
         # api2/api3 为官方故障切换域名）：api1 连不上时按顺序切换。
-        "gateway": "https://api1.qoder.sh",
-        "gateway_fallbacks": ("https://api2.qoder.sh", "https://api3.qoder.sh"),
+        # issue #64（逆向官方 0.4.8 的 endpoint 缓存）：国际版把推理与“安全推理”
+        # 拆成两个集群——inference=api3、securityInference=api2；api1 已不在官方
+        # 候选首位（本机实测也常年超时）。这里按官方顺序对齐：api3 主、api2/api1 备。
+        "gateway": os.environ.get("QD_INTL_GATEWAY") or "https://api3.qoder.sh",
+        "gateway_fallbacks": ("https://api2.qoder.sh", "https://api1.qoder.sh"),
+        # 官方另有 securityInference 用途端点（intl=api2）；网关不主动调用，仅记录。
+        "security_inference": "https://api2.qoder.sh",
         "website": "https://qoder.com",
         "client_id": "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
         "redirect_uri": "qoder://aicoding.aicoding-agent/login-success",
