@@ -47,9 +47,11 @@ import random
 import uuid
 
 import qoder_accounts
+import qoder_activity
 import qoder_agents
 import qoder_anthropic
 import qoder_catalog
+import qoder_pricing
 import qoder_settings
 import qoder_sign
 import qoder_updater
@@ -58,7 +60,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.2"
+VERSION = "1.6.3"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -454,6 +456,7 @@ def _empty_stats():
     return {"requests": 0, "errors": 0, "prompt_tokens": 0,
             "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
             "total_tokens": 0, "credit": 0.0, "original_credits": 0.0,
+            "cost_usd": 0.0, "unpriced": 0,
             "started": time.time(),
             "by_model": {},
             "ttft_ms_sum": 0, "ttft_samples": 0,
@@ -899,6 +902,18 @@ def usage_snapshot(realm=None, ttl=10):
     return data
 
 
+_PRICING_CACHE = {"at": 0.0, "data": {}}
+
+
+def _PRICING_OVERRIDES():
+    """usage/pricing-overrides.json，30 秒缓存（改完不用重启）。"""
+    now = time.time()
+    if now - _PRICING_CACHE["at"] > 30:
+        _PRICING_CACHE["data"] = qoder_pricing.load_overrides(USAGE_DIR)
+        _PRICING_CACHE["at"] = now
+    return _PRICING_CACHE["data"]
+
+
 def _usage_snapshot_uncached(realm=None):
     r = realm or CURRENT_REALM
     rep = POOL.representative(realm=r) if POOL else current_account()
@@ -931,6 +946,16 @@ def _usage_snapshot_uncached(realm=None):
                     for k in USAGE_FIELDS:
                         if k in row:
                             per[k] += (row[k] or 0)
+                    # 费用估算（参考 OpenRouter 价，读时折算；未知模型不计）
+                    _c = qoder_pricing.cost_of(
+                        row.get("model"), row.get("prompt_tokens") or 0,
+                        row.get("cached_tokens") or 0,
+                        row.get("completion_tokens") or 0, _PRICING_OVERRIDES())
+                    if _c is not None:
+                        snap["cost_usd"] = snap.get("cost_usd", 0.0) + _c
+                        per["cost_usd"] = per.get("cost_usd", 0.0) + _c
+                    else:
+                        snap["unpriced"] = snap.get("unpriced", 0) + 1
                     acct_id = row.get("account")
                     if acct_id:
                         per.setdefault("accounts", {})
@@ -8209,6 +8234,145 @@ class Handler(BaseHTTPRequestHandler):
             req_realm = query.get("realm", [None])[0] \
                 or self.headers.get("X-Realm") or CURRENT_REALM
             return self._json(200, usage_snapshot(realm=req_realm))
+
+        if path == "/pricing":
+            # 参考价目表（跟进 wb 的「OpenRouter 价估算」）：只读，不发网络请求
+            if not self._authorized():
+                return
+            _ov = _PRICING_OVERRIDES()
+            _seen = set()
+            try:
+                with open(USAGE_LOG, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            _seen.add(json.loads(line).get("model") or "")
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+            _unpriced = sorted(m for m in _seen if m
+                               and qoder_pricing.price_for(m, _ov) is None)
+            return self._json(200, {
+                "ok": True,
+                "table": qoder_pricing.table(USAGE_DIR),
+                "unpriced": _unpriced,
+                "note": "参考 OpenRouter 公布价折算，仅用于估算，不能用于结算；"
+                        "可在 usage/pricing-overrides.json 覆盖单价",
+            })
+        if path == "/accounts/credits/grants":
+            # 积分获取历史（跟进 wb）：只读内存里的积分快照，不发上游请求
+            if not self._authorized():
+                return
+            rows = []
+            snap_at = None
+            for acc in (POOL.accounts if POOL else []):
+                cred = getattr(acc, "credits", None)
+                if not isinstance(cred, dict):
+                    continue
+                at = cred.get("updated_at")
+                if at and (snap_at is None or at > snap_at):
+                    snap_at = at
+                for pkg in cred.get("packages") or []:
+                    if not isinstance(pkg, dict):
+                        continue
+                    rows.append({
+                        "account": (getattr(acc, "nickname", "") or
+                                    (getattr(acc, "uid", "") or "")[:8]),
+                        "realm": getattr(acc, "realm", "") or "",
+                        "name": pkg.get("name") or "",
+                        "size": pkg.get("size"),
+                        "remain": pkg.get("remain"),
+                        "used": pkg.get("used"),
+                        "expires_at": pkg.get("expires_at"),
+                        "updated_at": at,
+                    })
+            rows.sort(key=lambda r: (r.get("updated_at") or 0), reverse=True)
+            total_size = sum(int(r["size"] or 0) for r in rows)
+            total_remain = sum(int(r["remain"] or 0) for r in rows)
+            return self._json(200, {
+                "ok": True, "rows": rows,
+                "summary": {"count": len(rows), "size": total_size,
+                            "remain": total_remain,
+                            "snapshot_at": snap_at},
+                "note": "来自最近一次积分刷新/签到的快照，不是实时上游数据",
+            })
+        if path == "/accounts/activity":
+            # 签到 / 领取动作流水（跟进 wb_activity）：只读本地 jsonl，不发上游请求
+            if not self._authorized():
+                return
+            try:
+                limit = int((query.get("limit") or ["200"])[0])
+            except Exception:
+                limit = 200
+            rows = qoder_activity.recent(USAGE_DIR, limit=limit)
+            ok_count = sum(1 for r in rows if r.get("ok"))
+            earned = sum(int(r.get("amount") or 0) for r in rows
+                         if r.get("kind") == "checkin" and r.get("ok"))
+            return self._json(200, {
+                "ok": True, "rows": rows,
+                "summary": {"count": len(rows), "ok": ok_count,
+                            "failed": len(rows) - ok_count,
+                            "earned_credits": earned},
+                "note": "本机动作流水（签到/领取），30 天保留，不代表上游发放明细",
+            })
+        if path == "/usage/remaining":
+            # 剩余用量估算（跟进 wb）：按近 24h 实际消耗速率折算可用天数
+            if not self._authorized():
+                return
+            now = time.time()
+            used = {}
+            try:
+                with open(USAGE_LOG, encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except Exception:
+                            continue
+                        ts = row.get("ts") or row.get("time") or 0
+                        try:
+                            ts = float(ts)
+                        except Exception:
+                            continue
+                        if now - ts > 86400:
+                            continue
+                        if row.get("error"):
+                            continue
+                        uid = row.get("account") or ""
+                        slot = used.setdefault(uid[:8], {"credit": 0.0,
+                                                         "tokens": 0})
+                        slot["credit"] += float(row.get("credit") or 0)
+                        slot["tokens"] += int(row.get("total_tokens") or 0)
+            except Exception:
+                pass
+            out = []
+            for acc in (POOL.accounts if POOL else []):
+                cred = getattr(acc, "credits", None) or {}
+                remain = qoder_accounts.effective_remain(cred)
+                key = (getattr(acc, "uid", "") or "")[:8]
+                day = used.get(key) or {"credit": 0.0, "tokens": 0}
+                days = None
+                if isinstance(remain, (int, float)) and day["credit"] > 0:
+                    days = round(float(remain) / day["credit"], 1)
+                out.append({
+                    "account": getattr(acc, "nickname", "") or key,
+                    "uid": key,
+                    "realm": getattr(acc, "realm", "") or "",
+                    "remain": remain,
+                    "used_24h_credit": round(day["credit"], 2),
+                    "used_24h_tokens": day["tokens"],
+                    "days_left": days,
+                    "unlimited": qoder_accounts.shared_unlimited(cred),
+                })
+            out.sort(key=lambda r: (r["days_left"] is None, r["days_left"] or 0))
+            return self._json(200, {"ok": True, "rows": out,
+                                    "window_hours": 24,
+                                    "note": "按近 24h 消耗线性外推，仅供参考"})
         if path == "/usage/recent":
             if not self._authorized():
                 return
@@ -8796,6 +8960,12 @@ class Handler(BaseHTTPRequestHandler):
                                                   only_daily=True)
                 finally:
                     last_at = time.time()
+                qoder_activity.record(
+                    USAGE_DIR, "checkin", bool(res.get("ok")),
+                    uid=account.uid, nickname=account.nickname,
+                    realm=getattr(account, "realm", "") or "",
+                    detail=(res.get("msg") or res.get("reason") or ""),
+                    amount=res.get("earned_credit") or 0)
                 results.append({
                     "uid": account.uid,
                     "nickname": account.nickname,
