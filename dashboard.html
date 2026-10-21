@@ -1091,6 +1091,26 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
       <div id="keyList"></div>
     </section>
 
+
+    <section id="sectionWebTools">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
+        <div>
+          <h2 style="margin:0">本地 web 工具 <em id="setWebToolsState"></em></h2>
+          <div style="font-size:12px;color:var(--dim);margin-top:4px;line-height:1.7">
+            开启后，客户端声明的内置 <code>web_search</code> / <code>web_fetch</code> 会由<b>网关本地执行</b>：
+            把声明换成同名 function，模型要搜索时网关去搜（DuckDuckGo → Bing → Wikipedia 轮换）、要抓页面时网关去抓，
+            再把结果回灌给模型继续生成（最多 3 轮）。
+            <br><b style="color:var(--warn)">注意</b>：这是唯一会由模型驱动出网的能力；每轮代跑都会多消耗一次账号额度；
+            私网地址、localhost、重定向到内网一律拒绝。默认关闭。
+          </div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px;font-size:13px;white-space:nowrap">
+          <input type="checkbox" id="setWebTools" onchange="saveWebTools(this)">
+          <span>启用</span>
+        </label>
+      </div>
+    </section>
+
     <section id="sectionLimits">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;flex-wrap:wrap;gap:10px">
         <div>
@@ -3880,6 +3900,10 @@ async function startDashboard(){
 async function loadSettings(showToast){
   try {
     const data = await getJSON('/settings');
+    const wtBox = document.getElementById('setWebTools');
+    if(wtBox) wtBox.checked = data.web_tools === true;
+    const wtState = document.getElementById('setWebToolsState');
+    if(wtState) wtState.textContent = data.web_tools ? '(已开启)' : '(已关闭)';
     const pwdState = document.getElementById('setPwdState');
     if(pwdState){
       pwdState.textContent = data.panel_password_is_default ? '(当前为默认密码)' : '(已自定义)';
@@ -3923,6 +3947,23 @@ async function loadSettings(showToast){
   }
 }
 
+
+// 本地 web 工具开关（唯一由模型驱动出网的能力，默认关闭）
+async function saveWebTools(el){
+  const on = !!(el && el.checked);
+  el.disabled = true;
+  try{
+    const r = await postJSON("/settings/web-tools", {enabled: on});
+    toast("本地 web 工具已" + (r.web_tools ? "开启" : "关闭"), "ok");
+    const st = document.getElementById("setWebToolsState");
+    if(st) st.textContent = r.web_tools ? "(已开启)" : "(已关闭)";
+  }catch(e){
+    toast("保存失败: " + ((e && e.message) || e), "bad");
+    el.checked = !on;
+  }finally{
+    el.disabled = false;
+  }
+}
 async function savePanelPassword(btn){
   const cur = (document.getElementById('setPwdCurrent') || {}).value || '';
   const nw = (document.getElementById('setPwdNew') || {}).value || '';
