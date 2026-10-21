@@ -43,6 +43,7 @@ def recent(usage_dir, limit=200, days=KEEP_DAYS):
     path = _path(usage_dir)
     cutoff = time.time() - days * 86400
     out = []
+    seq = 0
     try:
         with open(path, encoding="utf-8") as fh:
             for line in fh:
@@ -55,12 +56,19 @@ def recent(usage_dir, limit=200, days=KEEP_DAYS):
                     continue
                 if float(row.get("ts") or 0) < cutoff:
                     continue
+                seq += 1
+                row["_seq"] = seq
                 out.append(row)
     except FileNotFoundError:
         return []
     except Exception:
         return out
-    out.sort(key=lambda r: r.get("ts") or 0, reverse=True)
+    # 同一毫秒写入的事件（Windows 计时精度约 15ms）靠写入顺序定先后：
+    # 后写的更新——否则「成功/失败」两条会因时间戳相同而顺序不定。
+    out.sort(key=lambda r: (r.get("ts") or 0, r.get("_seq") or 0),
+             reverse=True)
+    for row in out:                 # _seq 只用于排序，不外泄到 API
+        row.pop("_seq", None)
     try:
         limit = max(1, min(1000, int(limit)))
     except Exception:
