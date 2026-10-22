@@ -1455,6 +1455,12 @@ class Account(object):
         self.degrade_until = 0.0            # 未知错误降权窗口截止（不挡 ready）
         self.plan = str(data.get("plan") or "")
         self.last_checkin = data.get("lastCheckin") or None
+        # 面板展示：最近一次积分变化（签到 +100 / 消耗 -35）与时间
+        self.last_credits_delta = data.get("lastCreditsDelta")
+        try:
+            self.last_credits_delta_at = float(data.get("lastCreditsDeltaAt") or 0)
+        except (TypeError, ValueError):
+            self.last_credits_delta_at = 0.0
         # 已领取活动的兑换码（如「奶茶免单卡」REDEMPTION_CODE）：活动只发一次，
         # 必须落盘持久化，否则网关重启后用户就找不回兑换码了。
         self.campaign_codes = dict(data.get("campaignCodes") or {})
@@ -1502,6 +1508,8 @@ class Account(object):
             "creditsDegraded": self.credits_degraded,
             "plan": self.plan,
             "lastCheckin": self.last_checkin,
+            "lastCreditsDelta": self.last_credits_delta,
+            "lastCreditsDeltaAt": self.last_credits_delta_at,
             "campaignCodes": self.campaign_codes,
             "campaignBlockedUntil": self.campaign_blocked_until,
             "userType": self.user_type,
@@ -1563,6 +1571,10 @@ class Account(object):
             "lastCheckin": self.last_checkin,
             # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
             "canCheckin": self.can_checkin(),
+            "checkedInToday": self._checkin_stamped_today(),
+            "lastCheckinDate": str(self.last_checkin or "")[:10],
+            "lastCreditsDelta": self.last_credits_delta,
+            "lastCreditsDeltaAt": self.last_credits_delta_at,
             "checkinCapability": ("unknown" if self.checkin_capability()[0] is None
                                   else ("available" if self.checkin_capability()[0]
                                         else "not_found")),
@@ -2937,6 +2949,11 @@ class Account(object):
             if (shared and shared.get("available", True)
                 and not shared.get("unlimited")) else 0
         remain_effective = int(remain + _shared_avail)
+        _prev_eff = None
+        try:
+            _prev_eff = (self.credits or {}).get("remain_effective")
+        except Exception:
+            _prev_eff = None
         self.credits = {
             "remain": remain,
             "remain_effective": remain_effective,
@@ -2950,6 +2967,14 @@ class Account(object):
             "updated_at": time.time(),
             "updated_iso": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # 面板用：积分变化（正=进账、负=消耗）。只在数值真的变了时更新，
+        # 同日多次刷新保留最后一次，避免签到 +100 被后续刷新覆盖成 0。
+        try:
+            if _prev_eff is not None and int(_prev_eff) != int(remain_effective):
+                self.last_credits_delta = int(remain_effective) - int(_prev_eff)
+                self.last_credits_delta_at = time.time()
+        except Exception:
+            pass
         self.last_quota_anomaly = None    # 正常体：清掉上次异常标记
         self.credits_degraded = None
         # task-61：余额刷新是 402 停放的**唯一**解封路径（remain > 0 才解）。

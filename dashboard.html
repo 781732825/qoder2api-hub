@@ -386,6 +386,22 @@ a:hover{text-decoration:underline}
 #btnInsightRefresh.spin svg{animation:insightSpin .8s linear infinite}
 @keyframes insightSpin{to{transform:rotate(360deg)}}
 
+
+/* 账号行：今日签到徽标 + 积分变化 */
+.ck-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 8px;white-space:nowrap;
+  border-radius:999px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);
+  transition:background .18s ease,color .18s ease,border-color .18s ease}
+.ck-badge.done{color:#34d399;border-color:rgba(52,211,153,.45);background:rgba(52,211,153,.12)}
+.ck-badge.pending{color:#fbbf24;border-color:rgba(251,191,36,.42);background:rgba(251,191,36,.10)}
+.ck-badge svg{width:11px;height:11px}
+.delta-chip{display:inline-flex;align-items:center;gap:2px;font-size:11px;font-weight:600;white-space:nowrap;
+  padding:1px 7px;border-radius:999px;margin-left:6px;font-variant-numeric:tabular-nums;
+  animation:deltaPop .45s cubic-bezier(.2,.9,.3,1.4) both}
+.delta-chip.up{color:#34d399;background:rgba(52,211,153,.14)}
+.delta-chip.down{color:#f87171;background:rgba(248,113,113,.14)}
+.delta-chip.zero{color:var(--dim);background:var(--panel2)}
+@keyframes deltaPop{0%{opacity:0;transform:translateY(4px) scale(.85)}100%{opacity:1;transform:none}}
+@media (prefers-reduced-motion: reduce){.delta-chip{animation:none}}
 /* ================= 全局交互 polish ================= */
 .main-nav-btn{transition:background .18s ease,color .18s ease,border-color .18s ease,
   transform .12s ease,box-shadow .18s ease}
@@ -3001,6 +3017,30 @@ function accountGuardBadge(a){
   return '<span class="badge ok" title="' + title + '">正常</span>';
 }
 
+
+// 今日是否已签到（服务端 public() 的 checkedInToday / lastCheckinDate）
+function checkinBadge(a){
+  if(a && a.checkedInToday){
+    return '<span class="ck-badge done" title="今日已签到'
+      + (a.lastCheckinDate ? ("（" + esc(a.lastCheckinDate) + "）") : "") + '">'
+      + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>'
+      + '今日已签到</span>';
+  }
+  return '<span class="ck-badge pending" title="今日尚未签到"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>今日未签到</span>';
+}
+
+// 最近一次积分变化：正=进账（签到 +100），负=消耗
+function creditsDeltaChip(a){
+  const d = a && a.lastCreditsDelta;
+  if(d === null || d === undefined || d === "") return "";
+  const n = Number(d);
+  if(!isFinite(n) || n === 0) return "";
+  const cls = n > 0 ? "up" : "down";
+  const txt = (n > 0 ? "+" : "") + n;
+  const when = a.lastCreditsDeltaAt ? new Date(a.lastCreditsDeltaAt * 1000).toLocaleString() : "";
+  return '<span class="delta-chip ' + cls + '" title="最近一次积分变化 ' + txt
+    + (when ? ("（" + esc(when) + "）") : "") + '">' + esc(txt) + "</span>";
+}
 function accountRow(a){
   const realmBadge = a.realm === 'cn'
     ? '<span class="realm-badge-cn">国内版</span>'
@@ -3050,14 +3090,16 @@ function accountRow(a){
   return '<tr>'
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
-    +   '<div style="font-weight:600;font-size:13px;color:var(--fg)">' + esc(a.nickname) + '</div>'
+    +   '<div style="font-weight:600;font-size:13px;color:var(--fg);display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
+    +     esc(a.nickname) + checkinBadge(a) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + (a.note ? ('<div class="hint" style="margin:3px 0 0" title="备注（issue #69）"><span style="color:var(--accent)">备注</span> ' + esc(a.note) + '</div>') : '')
     + err + '</td>'
     + '<td style="text-align:center">' + state + '</td>'
     + '<td style="text-align:center;white-space:nowrap">' + accountGuardBadge(a) + '</td>'
-    + '<td style="text-align:left;white-space:nowrap">' + credText + freshLine + '</td>'
+    + '<td style="text-align:left;white-space:nowrap">' + credText
+    +   creditsDeltaChip(a) + freshLine + '</td>'
     + '<td style="text-align:right">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.total_tokens) + '</td>'
     + '<td style="text-align:right">' + fmt(usage.cached_tokens) + '</td>'
