@@ -9,6 +9,30 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.9
+
+**🐛 问题修复（国际版签到不可用 + 无提示）**
+
+- **原生机器身份缺失时 `desktop_headers()` 直接崩**：`native_machine_identity()` 在容器/桥失败时返回 `None`，`ident.get("machineToken")` 抛 `AttributeError`，任务异常而面板**不显示任何原因**。已按空 dict 处理，走 derived 分支。
+- **无原生身份时活动列表可能被隐藏**：新增「最小机器头」兜底——当 `showCampaign=false` 且机器头为 omitted 时，只用 `cosy-machineos` + `cosy-machinehostname` 重试一次（实测该组合仍被服务端视为官方客户端；六头全发才会被过滤）。可用 `QD_INTL_MACHINE_FALLBACK=off` 关闭。
+- **失败原因可见**：签到行在 `showCampaign=false` 时直接写明「缺原生机器身份 / 账号不在定向 / 出口被风控」，并给出安装命令 `python _install_umid.py --platform linux`。
+
+**⚡ 签到速度（实测 12.5s → 1.05s/账号，3 账号整批 3.5s）**
+
+- **legacy 端点不再逐个基址等超时**：`checkin_status`（国际版必然 404）此前 404 后仍换基址重试，单账号耗时 **12.5s**；现在只探主基址（`fallback=False`）、`retries 2 → 1`，并把 404 结果缓存 **6 小时** → 首次 1.05s，之后 0.00s。
+- **签到后刷新并行**：`fetch_credits` + `fetch_plan` 从串行改为并行（省约 1.2s）；去掉无意义的整秒等待（≤0.3s）。
+- 批量并发 3（`QD_CHECKIN_CONCURRENCY`），首个任务立即开始、其余 0–0.3s 错开。
+
+**✨ 新增：用量洞察独立板块**
+
+- 顶部导航新增 **用量洞察**（`#pageInsights`），从网关页拆出；四张**图标卡片**（等价花费 / 积分包 / 最快耗尽账号 / 签到成功率）+ 三张明细表；
+- 数字**滚动动画**、进度条过渡、卡片悬停抬升与图标缩放、表格行 stagger 入场、刷新按钮旋转态，全部尊重 `prefers-reduced-motion`；
+- 只在切到该标签时加载并 30s 轮询（不干扰其他页面）。
+
+**🎨 全局交互打磨**：导航/按钮位移与按压缩放、卡片悬停、表格行过渡、`:focus-visible` 焦点环、`::selection` 配色。
+
+**验证**：新增 `_test_insights_page.py`（19 条）、`_test_checkin_fallback_speed.py`（18 条）、`_test_intl_checkin.py`（13 条）；全量 **64 suites / 1842 checks / 0 failed**。真实 intl 账号实测领取成功（+100 Credits），批量 3 账号 3.54s。
+
 ## v1.6.8
 
 **🔍 可诊断性（#84：聚合网关侧报 `do_request_failed`）**

@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.8"
+VERSION = "1.6.9"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -9077,34 +9077,34 @@ class Handler(BaseHTTPRequestHandler):
             # 账号面板的「每日签到」按钮：**只做每日签到领积分**——Credits 类活动
             # （如"每天领 100 Credits"，旧 sash 接口兜底），不领券/兑换码类活动，
             # 也不领 Pro 福利包（那些走签到与福利中心的按钮）。
+            #
+            # 并发：签到是「每账号一次上游往返」，串行时 N 个账号 = N 个 RTT +
+            # N 次间隔，面板上就是「点了没反应」。现在默认 3 并发
+            # （QD_CHECKIN_CONCURRENCY 1–8），启动前加 0~0.8s 抖动错开。
             import qoder_tasks
+            from concurrent.futures import ThreadPoolExecutor, as_completed
             uid = payload.get("uid")
             targets = [POOL.get(uid)] if uid else list(POOL.accounts)
-            results = []
-            last_at = None
-            for account in targets:
-                if account is None:
-                    continue
-                if not account.enabled or not account.access_token:
-                    continue            # 跳过的账号不占用防风控等待
-                if last_at is not None:
-                    # 账号之间保持 >= CHECKIN_MIN_GAP（与 qoder_tasks.py 声明的
-                    # >=1.0s 一致）；try/finally 让失败路径同样计时间隔。
-                    idle = CHECKIN_MIN_GAP - (time.time() - last_at)
-                    if idle > 0:
-                        time.sleep(idle)
-                try:
-                    res = qoder_tasks.run_checkin(account, gap=CHECKIN_MIN_GAP,
-                                                  only_daily=True)
-                finally:
-                    last_at = time.time()
+            targets = [a for a in targets
+                       if a is not None and a.enabled and a.access_token]
+            results = [None] * len(targets)
+
+            def _one(idx, account):
+                # 首个任务立即开始，其余 0~0.3s 错开（避免机器枪特征又不拖慢整批）
+                if idx:
+                    try:
+                        time.sleep(random.uniform(0, 0.3))
+                    except Exception:
+                        pass
+                res = qoder_tasks.run_checkin(account, gap=CHECKIN_MIN_GAP,
+                                              only_daily=True)
                 qoder_activity.record(
                     USAGE_DIR, "checkin", bool(res.get("ok")),
                     uid=account.uid, nickname=account.nickname,
                     realm=getattr(account, "realm", "") or "",
                     detail=(res.get("msg") or res.get("reason") or ""),
                     amount=res.get("earned_credit") or 0)
-                results.append({
+                return {
                     "uid": account.uid,
                     "nickname": account.nickname,
                     "ok": bool(res.get("ok")),
@@ -9112,18 +9112,37 @@ class Handler(BaseHTTPRequestHandler):
                     "msg": (res.get("logs") or [""])[-1],
                     "logs": res.get("logs") or [],
                     "credits": res.get("credits"),
-                    # issue #20：透传 qoder_tasks 的精确结论（前端一直在读
-                    # message / claimed / next_available_*，此前永远 undefined）。
-                    # 新增而非替换：msg/logs/credits 原样保留。naonao 的契约
-                    # （qoder_tasks 活动平台路径）保证 claimed 是**字符串列表**；
-                    # 老路径（旧 sash 兜底）不带该键 -> 这里统一给 []，
-                    # 让前端只需 Array.isArray 判定，不用再判 None。
-                    # message / next_available_* 缺失时仍为 None（不编造）。
+                    # issue #20：透传活动平台的精确结论（前端一直在读）。
                     "message": res.get("message"),
                     "claimed": res.get("claimed") or [],
                     "next_available_at": res.get("next_available_at"),
                     "next_available_note": res.get("next_available_note"),
-                })
+                }
+
+            if targets:
+                try:
+                    workers = max(1, min(8, int(
+                        os.environ.get("QD_CHECKIN_CONCURRENCY") or 3)))
+                except Exception:
+                    workers = 3
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = {pool.submit(_one, i, a): i
+                               for i, a in enumerate(targets)}
+                    for fut in as_completed(futures):
+                        idx = futures[fut]
+                        try:
+                            results[idx] = fut.result()
+                        except Exception as exc:
+                            acc = targets[idx]
+                            results[idx] = {
+                                "uid": acc.uid, "nickname": acc.nickname,
+                                "ok": False, "earned_credit": 0,
+                                "msg": "签到异常: %s" % str(exc)[:120],
+                                "logs": [], "credits": None,
+                                "message": None, "claimed": [],
+                                "next_available_at": None,
+                                "next_available_note": None}
+            results = [r for r in results if r]
             qoder_tasks.invalidate_panel_cache()   # 写操作后失效面板短缓存
             return self._json(200, {"results": results,
                                     "accounts": account_views()})
