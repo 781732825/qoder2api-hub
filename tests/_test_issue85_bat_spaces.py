@@ -29,43 +29,46 @@ check("bat 仍保持 ASCII（无中文注释）",
       all(ord(ch) < 128 for ch in _start))
 
 print("[#85] 端到端（临时目录带空格 + 桩脚本）")
-import json
-import shutil
-import subprocess
-import tempfile
-import time
+if os.name != 'nt':
+    print("  [skip] Windows-only 端到端用例")
+else:
 
-_tmp = tempfile.mkdtemp(prefix="qd space-")
-_dst = os.path.join(_tmp, "my project", "qoder proxy")
-os.makedirs(_dst, exist_ok=True)
-shutil.copy2(os.path.join(ROOT, "start-qoder-proxy.bat"), _dst)
-_argv_path = os.path.join(_dst, "argv.json")
-io.open(os.path.join(_dst, "qoder_proxy.py"), "w", encoding="utf-8").write(
-    "import json, sys\n"
-    "open(r'%s', 'w', encoding='utf-8').write(json.dumps(sys.argv, ensure_ascii=False))\n"
-    % _argv_path.replace("\\", "\\\\"))
-_env = dict(os.environ, QD_NO_PAUSE="1")
-for _k in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "no_proxy"):
-    _env.pop(_k, None)
-_run = subprocess.run(["cmd", "/c", "start-qoder-proxy.bat", "18766"], cwd=_dst,
-                      env=_env, capture_output=True, text=True, timeout=90,
-                      errors="replace")
-for _ in range(20):
+    import json
+    import shutil
+    import subprocess
+    import tempfile
+    import time
+
+    _tmp = tempfile.mkdtemp(prefix="qd space-")
+    _dst = os.path.join(_tmp, "my project", "qoder proxy")
+    os.makedirs(_dst, exist_ok=True)
+    shutil.copy2(os.path.join(ROOT, "start-qoder-proxy.bat"), _dst)
+    _argv_path = os.path.join(_dst, "argv.json")
+    io.open(os.path.join(_dst, "qoder_proxy.py"), "w", encoding="utf-8").write(
+        "import json, sys\n"
+        "open(r'%s', 'w', encoding='utf-8').write(json.dumps(sys.argv, ensure_ascii=False))\n"
+        % _argv_path.replace("\\", "\\\\"))
+    _env = dict(os.environ, QD_NO_PAUSE="1")
+    for _k in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "no_proxy"):
+        _env.pop(_k, None)
+    _run = subprocess.run(["cmd", "/c", "start-qoder-proxy.bat", "18766"], cwd=_dst,
+                          env=_env, capture_output=True, text=True, timeout=90,
+                          errors="replace")
+    for _ in range(20):
+        if os.path.exists(_argv_path):
+            break
+        time.sleep(0.5)
+    _argv = []
     if os.path.exists(_argv_path):
-        break
-    time.sleep(0.5)
-_argv = []
-if os.path.exists(_argv_path):
-    try:
-        _argv = json.loads(io.open(_argv_path, encoding="utf-8").read())
-    except Exception:
-        _argv = []
-check("带空格目录下脚本被当作**一个**参数传入",
-      bool(_argv) and _argv[0].endswith("qoder_proxy.py")
-      and " " in _argv[0], _argv[:2])
-check("--port / --pid-file 正常拆分",
-      "--port" in _argv and "18766" in _argv
-      and "--pid-file" in _argv and _argv[-1].endswith("qoder-proxy.pid"),
-      _argv)
-
+        try:
+            _argv = json.loads(io.open(_argv_path, encoding="utf-8").read())
+        except Exception:
+            _argv = []
+    check("带空格目录下脚本被当作**一个**参数传入",
+          bool(_argv) and _argv[0].endswith("qoder_proxy.py")
+          and " " in _argv[0], _argv[:2])
+    check("--port / --pid-file 正常拆分",
+          "--port" in _argv and "18766" in _argv
+          and "--pid-file" in _argv and _argv[-1].endswith("qoder-proxy.pid"),
+          _argv)
 finish()
