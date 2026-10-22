@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.11"
+VERSION = "1.6.12"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6155,7 +6155,8 @@ def _chat_chunks_iter(obj, model):
             for c in _chat_chunks(obj, model)]
 
 
-def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
+def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
+                  only_account=None):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
 
     usage_ctx：可选**出参** dict。传入时回填本次请求的推理档位审计信息
@@ -6176,6 +6177,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     全部账号失败后抛 RateLimited 或最后一个错误。
     """
     model = str(payload.get("model") or "")
+    if only_account is not None and not target_realm:
+        # issue #86：钉死账号时区域跟随该账号（自动路由可能把它换掉）
+        target_realm = getattr(only_account, "realm", "") or None
     realm = target_realm or detect_model_realm(model) or CURRENT_REALM
     if not target_realm:
         # 步2：只在**用户没显式指定**时，按账号可用性兜底换区
@@ -6189,7 +6193,9 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                 usage_ctx["realm_reason"] = auto_realm_reason(model, realm)
     model_key = qoder_catalog.resolve_upstream_key(model, realm=realm)
 
-    representative = POOL.pick(realm=realm) if POOL else None
+    # issue #86：钉死账号时用它构造请求体（身份类字段必须与被测号一致）
+    representative = (only_account if only_account is not None
+                      else (POOL.pick(realm=realm) if POOL else None))
     body_obj = build_qoder_body(payload, representative, model_key, realm=realm)
     if usage_ctx is not None:
         # 实际下发档位直接取自请求体（build_qoder_body 只在 norm 非 None 时写入），
@@ -6215,7 +6221,8 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
             log("affinity: derived %s for %d msgs"
                 % (session_key, len(body_obj.get("messages") or [])))
 
-    total = _realm_ready_total(realm, model)   # #29：与冷却函数共用同一口径
+    # issue #86：钉死账号按单账号池处理（冷却压到 3s、不跨号轮换）
+    total = 1 if only_account is not None else _realm_ready_total(realm, model)
     tried = set()
     last_error = None
     last_429 = None
@@ -6235,8 +6242,12 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
     # 额外 +2 次迭代预算：只供“短错误冷却等待续上”使用（正常轮换仍由
     # tried 集合自然终止）。
     for _ in range(total + 2):
-        account = POOL.pick_for_session(realm=realm, session_key=session_key,
-                                        exclude=tried, model=model) if POOL else None
+        if only_account is not None:
+            # issue #86：账号测试必须落在被点的那个号上，不能走会话粘性/轮询
+            account = only_account if only_account.uid not in tried else None
+        else:
+            account = POOL.pick_for_session(realm=realm, session_key=session_key,
+                                            exclude=tried, model=model) if POOL else None
         if account is None:
             if not waited_cool:
                 wait = _short_error_cooldown_wait(realm, model,
@@ -6249,7 +6260,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None):
                     time.sleep(wait + 0.25)
                     continue     # 冷却到期后重新 pick，服务该请求
             break
-        if account.realm != realm:
+        if account.realm != realm and only_account is None:
             if session_key and POOL:
                 POOL.affinity.unbind(session_key)
             continue
@@ -9244,7 +9255,10 @@ class Handler(BaseHTTPRequestHandler):
             }
             t0 = time.time()
             try:
-                resp, acc, _ = open_upstream(test_payload, target_realm=acc_realm(account))
+                # issue #86：必须测试被点的那个号（此前会落到池里任意账号）
+                resp, acc, _ = open_upstream(
+                    test_payload, target_realm=acc_realm(account),
+                    only_account=account)
                 with resp:
                     chat_obj = aggregate_stream(resp, test_model, None)
                 wall_ms = int((time.time() - t0) * 1000)
@@ -9254,7 +9268,7 @@ class Handler(BaseHTTPRequestHandler):
                               or "OK").strip()
                 if len(reply_text) > 80:
                     reply_text = reply_text[:77] + "..."
-                account.clear_error()
+                acc.clear_error()      # 清的是**实际**被测账号（issue #86）
                 log("account test: uid=%s model=%s wall=%dms ok=True"
                     % (account.uid[:8], test_model, wall_ms), tag="accounts")
                 return self._json(200, {"ok": True, "uid": account.uid,
