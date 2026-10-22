@@ -9,6 +9,22 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.6
+
+**🐛 问题修复**
+
+- **面板「智能体配置」的默认模型下拉恒为空**（#81，PR #82 by @turmony）：`GET /agents/models` 恒返回 `{"models": []}`。两处缺陷叠加：
+  1. `gateway_models_for_agents()` 把 `fetch_models_merged()` 的返回值当 `dict` 解析，而它返回的是 `(mid, meta, realm)` **元组**，`isinstance(e, dict)` 全判负；
+  2. 带 `realm` 时调用 `fetch_models_merged(realm=...)`，该函数没有这个参数 → `TypeError`，被外层 `except` 吞掉。
+  现在：不带 `realm` 用两区并集，带 `realm` 用 `fetch_models(realm=...)`，再统一经 `model_entry()` 展开（与 `/v1/models` 同源），取 `id` / `context_window` / `max_output`。
+  实测：`/agents/models` **0 → 19** 个模型、`?realm=cn` **0 → 14**；与 `/v1/models` 的 id 集合逐一对齐。
+
+**🧪 测试**
+
+- 新增 `tests/_test_issue81_agents_models.py`（20 条）：三种调用非空、id 与 `/v1/models` 一致且不重复、`context_window`/`max_output` 与 `model_entry` 一致、源码守卫禁止 `fetch_models_merged(<实参>)`。
+
+**验证**：合并后全量 **59 suites / 1774 checks / 0 failed**。
+
 ## v1.6.5
 
 **🐛 问题修复**
