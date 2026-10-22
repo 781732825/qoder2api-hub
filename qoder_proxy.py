@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.7"
+VERSION = "1.6.8"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -7949,6 +7949,30 @@ class Handler(BaseHTTPRequestHandler):
         self._json(code, {"error": {"message": message, "type": err_type,
                                     "code": code}})
 
+    def _unknown_path_error(self, path):
+        """404，并针对最常见的「接入地址填错」给出可执行提示。
+
+        聚合网关（new-api / one-api 等）配渠道时最常见的两类错：
+          · base URL 里已经带了 /v1，客户端又拼一次 -> /v1/v1/chat/completions；
+          · 把 OpenAI 的路径整段填进 base URL -> /v1/chat/completions/v1/chat/completions。
+        这两类以前只会得到一句 not found，很难自证；现在直接把原因写进错误体并记 WARN。
+        """
+        p = str(path or "")
+        hint = ""
+        if p.count("/v1") > 1:
+            hint = ("base URL 里已经带了 /v1，客户端又拼了一次；把渠道地址填成 "
+                    "http://<host>:8790（不带 /v1）即可")
+        elif p.rstrip("/").endswith("/v1/chat/completions") and p.count("/") > 3:
+            hint = "base URL 填成了完整接口路径；只需填 http://<host>:8790"
+        try:
+            log("404 unknown path: %s%s"
+                % (p, (" — " + hint) if hint else ""),
+                level="WARN", tag="http")
+        except Exception:
+            pass
+        return self._error(404, "not found: %s%s" % (p, (" — " + hint) if hint else ""),
+                           "invalid_request_error")
+
     def _rate_limited(self, exc):
         """429 with Retry-After, so clients back off instead of hammering."""
         wait = max(1, int(getattr(exc, "wait", 60) or 60))
@@ -8702,7 +8726,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(200, {"id": wanted,
                                             "key": entry.get("key") or ""})
             return self._error(404, "no such key", "invalid_request_error")
-        return self._error(404, "not found", "invalid_request_error")
+        return self._unknown_path_error(path)
 
     def _dashboard(self):
         try:
@@ -8929,7 +8953,7 @@ class Handler(BaseHTTPRequestHandler):
                 PANEL.revoke_all()
             token = PANEL.create()
             return self._json(200, {"ok": True, "token": token})
-        return self._error(404, "not found", "invalid_request_error")
+        return self._unknown_path_error(path)
 
     def _handle_accounts(self, path, payload):
         """Account-management endpoints (dashboard uses these)."""
@@ -10002,7 +10026,7 @@ class Handler(BaseHTTPRequestHandler):
                     "this gateway speaks Chat Completions and Responses. "
                     "Use /v1/chat/completions with messages=[...] instead.",
                     "invalid_request_error")
-            return self._error(404, "not found", "invalid_request_error")
+            return self._unknown_path_error(path)
         if not self._authorized():
             return
         payload = self._payload_or_error(allow_list=(path == "/accounts/import"))
