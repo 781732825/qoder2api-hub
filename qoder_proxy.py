@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.6"
+VERSION = "1.6.7"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -5689,8 +5689,18 @@ def _handle_envelope_account_cooldown(account, exc, model=None, session_key=None
             account.note_unknown_failure("envelope HTTP %s" % status_int)
 
 def _alt_realm_ready(realm, model=""):
-    """另一个区是否还有可用账号（issue #71 跨区 failover 用）。"""
-    other = "intl" if realm == "cn" else "cn"
+    """另一个区是否还有可用账号（issue #71 跨区 failover 用）。
+
+    issue #83：`realm` 可能是 None（#76 起入口不再把「未指定」折叠成当前区）。
+    旧实现 `"intl" if realm == "cn" else "cn"` 会把 None 当成「非 cn」-> 返回 cn，
+    于是「切到 cn -> 又排队 -> 再切 cn」无限循环（现场日志刷屏、请求永不结束）。
+    现在先把 None 解析成**实际出口**，再取另一区；解析结果与目标相同就返回空。
+    """
+    base = realm or detect_model_realm(model) or CURRENT_REALM
+    base = base if base in ("cn", "intl") else "cn"
+    other = "intl" if base == "cn" else "cn"
+    if not other or other == base:
+        return ""
     try:
         return other if _realm_ready_total(other, model) > 0 else ""
     except Exception:
@@ -9669,6 +9679,8 @@ class Handler(BaseHTTPRequestHandler):
                 attempts = 0
                 cur = upstream
                 pump_exc = None
+                # issue #83: cross-realm failover at most once per request
+                _switched71 = False
                 try:
                     while True:
                         try:
@@ -9741,9 +9753,11 @@ class Handler(BaseHTTPRequestHandler):
                             # 仍不行再转成 429 + Retry-After，而不是把 403 丢给客户端。
                             _alt71 = ("" if self.headers.get("X-Realm") else
                                       _alt_realm_ready(req_realm, model))
-                            if _envelope_queue_wait(exc) > 0 and _alt71:
+                            if (_envelope_queue_wait(exc) > 0 and _alt71
+                                    and not _switched71):
                                 log("queue exhausted -> failing over to %s (issue #71)"
                                     % _alt71, level="WARN", tag="chat")
+                                _switched71 = True
                                 try:
                                     cur2, account, _ = open_upstream(
                                         chat_req, session_key=session_key,
@@ -10095,6 +10109,8 @@ class Handler(BaseHTTPRequestHandler):
                 attempts = 0
                 cur = upstream
                 pump_exc = None
+                # issue #83: cross-realm failover at most once per request
+                _switched71 = False
                 try:
                     while True:
                         try:
@@ -10154,9 +10170,11 @@ class Handler(BaseHTTPRequestHandler):
                             # 仍不行再转成 429 + Retry-After，而不是把 403 丢给客户端。
                             _alt71 = ("" if self.headers.get("X-Realm") else
                                       _alt_realm_ready(req_realm, model))
-                            if _envelope_queue_wait(exc) > 0 and _alt71:
+                            if (_envelope_queue_wait(exc) > 0 and _alt71
+                                    and not _switched71):
                                 log("queue exhausted -> failing over to %s (issue #71)"
                                     % _alt71, level="WARN", tag="chat")
+                                _switched71 = True
                                 try:
                                     cur2, account, _ = open_upstream(
                                         payload, session_key=session_key,

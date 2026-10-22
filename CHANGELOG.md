@@ -9,6 +9,19 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.7
+
+**🐛 问题修复（严重）**
+
+- **跨区 failover 死循环，请求永不结束、日志刷屏**（#83）：`_alt_realm_ready()` 用 `"intl" if realm == "cn" else "cn"` 取「另一个区」——而 #76 之后 `realm` 可能是 `None`（未指定出口），`None` 走 else 分支得到 **cn**。于是当请求实际已在 cn 上排队时，网关把「另一区」也算成 cn：**切到 cn → 又排队 → 再切 cn**，无限循环，每个请求都拖到超时，客户端只看到 `upstream stream ended before a completion event`。
+  修法两处：
+  1. `_alt_realm_ready()` 先把 `realm` 解析成**实际出口**（`realm or detect_model_realm(model) or CURRENT_REALM`）再取另一区，且**解析结果与目标相同就返回空**；
+  2. 两条流式路径的跨区 failover 加「每请求只切一次」标记（`_switched71`），切过一次后仍排队就直接转 **429 + Retry-After**，不再反复切。
+
+  修复后的行为：cn 排队 → 若 intl 同模型有就绪账号则切过去**一次**；那边也排队 → 直接 429（带 `retryAfterSeconds`），日志不再刷屏。
+
+**验证**：新增 `tests/_test_issue83_failover_loop.py`（11 条：三区解析、None 解析、独占模型、无就绪账号、探测异常、两处源码守卫）；全量 **60 suites / 1785 checks / 0 failed**。
+
 ## v1.6.6
 
 **🐛 问题修复**
