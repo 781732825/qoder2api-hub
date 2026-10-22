@@ -657,8 +657,19 @@ def _persist_usage(row, summary, fail_label):
         log("%s: %s" % (fail_label, exc))
 
 
-def record_error(model, status, message, elapsed_ms=None):
-    """Count a failed request and append it to the log so errors are visible."""
+def record_error(model, status, message, elapsed_ms=None,
+                 stream=None, account=None, key_id=None):
+    """Count a failed request and append it to the log so errors are visible.
+
+    后三个参数与 record_usage 同构，全是**可选**：不传就一个键都不写，行格式
+    与改动前逐字节一致（老调用路径与历史日志不受影响）。
+      stream   是否流式请求
+      account  出错的账号 uid（拿得到才传：open_upstream 失败时选号未成功，
+               调用点手里没有 account，传 None 即可——不能为了填字段去猜）
+      key_id   API key 标识，同 record_usage（不涉明文）
+    失败行带上账号/Key，才能看出「是哪个号在失败、是不是某个 Key 的客户端在
+    打」；此前失败行这三项恒为空，面板只能显示成「历史行未记录 Key」。
+    """
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -669,6 +680,12 @@ def record_error(model, status, message, elapsed_ms=None):
         "message": str(message)[:400],
         "elapsed_ms": elapsed_ms,
     }
+    if stream is not None:
+        row["stream"] = bool(stream)
+    if account:
+        row["account"] = account
+    if key_id:
+        row["key_id"] = key_id
     with _lock:
         _usage["errors"] += 1
         if elapsed_ms is not None:
@@ -9328,6 +9345,9 @@ class Handler(BaseHTTPRequestHandler):
             % (model, want_stream, len(chat_req.get("messages") or []),
                chat_req.get("reasoning_effort"),
                bool(chat_req.get("_qd_structured"))))
+        # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
+        # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
+        account = None
         try:
             usage_ctx = {}
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
@@ -9341,14 +9361,20 @@ class Handler(BaseHTTPRequestHandler):
             self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等本地拦下的错误——明确状态码，
             # 不进账号冷却/重试链路（上游根本没收到这个请求）。
             _code = _to_int_status(exc.status)
             record_error(model, _code, exc.detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -9359,13 +9385,19 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     detail = ""
             record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -9408,7 +9440,10 @@ class Handler(BaseHTTPRequestHandler):
                     _handle_envelope_account_cooldown(account, exc, model=model,
                                                       session_key=session_key)
                     wall = int((time.time() - t_start) * 1000)
-                    record_error(model, exc.status, exc.detail, elapsed_ms=wall)
+                    record_error(model, exc.status, exc.detail,
+                                 elapsed_ms=wall, stream=True,
+                                 account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
                     msg, _ = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                     log("anthropic upstream status %s: %s"
@@ -9434,14 +9469,20 @@ class Handler(BaseHTTPRequestHandler):
                     holder, account)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 msg, etype = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                 return self._error(
                     exc.status if str(exc.status).isdigit() else 502, msg, etype)
             except Exception as exc:
                 record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = qoder_anthropic.chat_to_messages(chat_obj, model=model)
@@ -9550,6 +9591,10 @@ class Handler(BaseHTTPRequestHandler):
                sorted(custom_names) or "-"))
         holder = {"usage": None, "custom_names": custom_names,
                   "allowed_names": _tool_names_from_payload(chat_req)}
+        # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
+        # 而选号成功前它就是 None。放在 try 内、open_upstream 之前也行 —— 只要
+        # 在**任何可能抛异常的语句之前**（_request_realm 也不保证不抛）。
+        account = None
         try:
             req_realm = self._request_realm()
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
@@ -9565,14 +9610,19 @@ class Handler(BaseHTTPRequestHandler):
         except RateLimited as exc:
             t = time.time() - t_start
             record_error(model, 429, exc.detail[:200],
-                         elapsed_ms=int(t * 1000))
+                         elapsed_ms=int(t * 1000), stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
             # 明确状态码 + 可读文案，且不进入账号冷却/重试链路。
             _code = _to_int_status(exc.status)
             record_error(model, _code, exc.detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -9585,13 +9635,19 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     detail = ""
             record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -9708,7 +9764,10 @@ class Handler(BaseHTTPRequestHandler):
                             pass
                 if pump_exc is not None:
                     record_error(model, pump_exc.status, pump_exc.detail,
-                                 elapsed_ms=int((time.time() - t_start) * 1000))
+                                 elapsed_ms=int((time.time() - t_start) * 1000),
+                                 stream=True,
+                                 account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
                     msg, _ = friendly_upstream_error(
                         _to_int_status(pump_exc.status), pump_exc.detail)
                     log("responses upstream status %s: %s"
@@ -9740,14 +9799,20 @@ class Handler(BaseHTTPRequestHandler):
                     holder, account)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 msg, etype = friendly_upstream_error(_to_int_status(exc.status),
                                                      exc.detail)
                 return self._error(exc.status if str(exc.status).isdigit() else 502,
                                    msg, etype)
             except Exception as exc:
                 record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             result = chat_to_response(chat_obj, model, custom_names)
@@ -9951,6 +10016,9 @@ class Handler(BaseHTTPRequestHandler):
         log("chat: model=%s client_effort=%r stream=%s msgs=%d"
             % (model, effort, want_stream,
                len(payload.get("messages") or [])))
+        # account 预置在 try 之外：下面所有 except 里的 record_error 都会引用它，
+        # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
+        account = None
         try:
             req_realm = self._request_realm()
             usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
@@ -9965,14 +10033,20 @@ class Handler(BaseHTTPRequestHandler):
             self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             record_error(model, 429, exc.detail[:200],
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             return self._rate_limited(exc)
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等**上游未收到**的错误走这里——
             # 明确状态码 + 可读文案，且不进入账号冷却/重试链路。
             _code = _to_int_status(exc.status)
             record_error(model, _code, exc.detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
             return self._error(_code, _msg, _etype)
         except urllib.error.HTTPError as exc:
@@ -9985,13 +10059,19 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     detail = ""
             record_error(model, exc.code, detail,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             msg, etype = friendly_upstream_error(exc.code, detail)
             return self._error(exc.code, msg, etype)
         except Exception as exc:
             message = str(exc)
             record_error(model, 502, message,
-                         elapsed_ms=int((time.time() - t_start) * 1000))
+                         elapsed_ms=int((time.time() - t_start) * 1000),
+                         stream=want_stream,
+                         account=account.uid if account else None,
+                         key_id=self._key_id_for_usage())
             if message.startswith("no usable account"):
                 return self._error(503, message
                                    + " - add or enable one at the dashboard (/)")
@@ -10098,7 +10178,10 @@ class Handler(BaseHTTPRequestHandler):
                 if pump_exc is not None:
                     exc = pump_exc
                     wall = int((time.time() - t_start) * 1000)
-                    record_error(model, exc.status, exc.detail, elapsed_ms=wall)
+                    record_error(model, exc.status, exc.detail,
+                                 elapsed_ms=wall, stream=True,
+                                 account=account.uid if account else None,
+                                 key_id=self._key_id_for_usage())
                     msg, etype = friendly_upstream_error(
                         _to_int_status(exc.status), exc.detail)
                     err = json.dumps({"error": {
@@ -10135,7 +10218,10 @@ class Handler(BaseHTTPRequestHandler):
                     holder, account)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 code = exc.status if str(exc.status).isdigit() else 502
                 try:
                     code = int(code)
@@ -10148,7 +10234,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._error(code, msg, etype)
             except Exception as exc:
                 record_error(model, 502, str(exc),
-                             elapsed_ms=int((time.time() - t_start) * 1000))
+                             elapsed_ms=int((time.time() - t_start) * 1000),
+                             stream=want_stream,
+                             account=account.uid if account else None,
+                             key_id=self._key_id_for_usage())
                 return self._error(502, "upstream stream error: %s" % exc)
             wall = int((time.time() - t_start) * 1000)
             first_at = result.get("first_chunk_at")

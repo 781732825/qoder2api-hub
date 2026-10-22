@@ -131,6 +131,22 @@ def main(argv):
     env["PYTHONIOENCODING"] = "utf-8"
     if not shutil.which("node"):
         env.pop("NODE_OK", None)
+    # 测试用量目录：所有套件都走临时目录，一个字节都不写仓库的 usage/。
+    # 这里是**唯一能可靠覆盖所有套件**的地方 —— 有些套件（_test_model_gates /
+    # _test_anthropic_wiring / _test_failure_families / _test_credits_guard）
+    # 绕过 bootstrap() 自己 import qoder_proxy，靠 _suite_head 的 setdefault
+    # 管不到它们，必须由 runner 直接注入环境变量。
+    _acc_usage = os.path.join(ROOT, "_acc", "usage")
+    env.setdefault("QD_PROXY_USAGE_DIR", _acc_usage)
+    # 跑前清一次：套件每次请求都会 append 一行，不清则越跑越大。
+    # 只删隔离区，真实用量在 <ROOT>/usage，绝不被碰。
+    # 不用 ignore_errors：Windows 上杀软/残留句柄导致的 PermissionError 会被
+    # 吞掉，目录没清却看着「清过了」。清不掉就直说。
+    if os.path.isdir(_acc_usage):
+        try:
+            shutil.rmtree(_acc_usage)
+        except OSError as exc:
+            print("  [warn] could not clear %s: %s" % (_acc_usage, exc))
     with _cf.ThreadPoolExecutor(max_workers=jobs) as ex:
         results = list(ex.map(lambda n: run_one(n, logdir, env), selected))
     failed = []
