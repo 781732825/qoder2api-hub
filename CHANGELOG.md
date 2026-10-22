@@ -9,6 +9,21 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.5
+
+**🐛 问题修复**
+
+- **Anthropic 入口的结构化工具历史恒为 False**（#79，PR #80 by @rongyuio）：#76/PR #77 让三个入口在「未指定出口」时传 `None`，但 `_handle_anthropic` 的**形态决策**也拿到了这个 `None`——而 `structured_tool_history_enabled()` 的 auto 分支要求 `realm == "cn"`，`None` 直接判负，白名单（`deepseek` / `dfmodel` 等）永远不生效。结果是每个 Anthropic 请求都回退文本化，模型重新看到 `LEAK_MARKER` 并按 #49 的方式复述成正文。
+  修法：形态决策用与 `open_upstream` **同源**的兜底（`req_realm or detect_model_realm(model) or CURRENT_REALM`），但**不改动** `req_realm` 本身（它要作为 `target_realm` 传给路由，改了会跳过自动选路）。新增 `tests/_test_issue79_structured_realm.py`（源码守卫 + 真值表 + 金丝雀）。
+- **失败行缺账号 / Key / 流式字段**（PR #78 by @cliffcat）：`record_error` 一直没有 `stream` / `account` / `key_id`，失败行进 `usage.jsonl` 时三项恒为空，面板只能显示「账号=-、Key=历史行未记录」。现在 21 个调用点全部回填；**不传就一个键都不写**（历史行格式不变）；选号失败时 `account` 保持空（不猜）。
+- **`vm_status` 来源谎报**（PR #78）：桥不可用 + 物理机时结论来自本机交叉校验，却被标成 `runtime-info`；反向的「桥可用但无 vmInfo 却写桥不可用」也一并修掉，现在按三种情况分别措辞。
+
+**🧪 测试**
+
+- **测试不再污染线上用量**（PR #78）：`_test_qoder.py` 的环境变量名写错（`USAGE_DIR` vs `QD_PROXY_USAGE_DIR`）、`bootstrap()` 只隔离账号目录、4 个套件直接 import 绕过 `bootstrap` —— 现在由 `run_all.py` 统一注入用量目录，并在跑前清理 `_acc/usage`。实测跑前后仓库 `usage/usage.jsonl` 的 md5 不变。
+
+**验证**：PR #80 独立 57 suites / 1740 checks；PR #78 独立 57 suites / 1737 checks；合并后全量 **58 suites / 1754 checks / 0 failed**。
+
 ## v1.6.4
 
 **✨ 新增功能：本地 web 工具（默认关闭）**
