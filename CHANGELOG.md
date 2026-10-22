@@ -9,6 +9,21 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.10
+
+**🐛 问题修复**
+
+- **启动 bat 无法处理带空格的路径**（#85）：`Start-Process -ArgumentList '%SCRIPT%','--port',...` 的每个元素**不会自动加引号**，路径里有空格时会被拆成多个参数（`C:\Users\My` / `Project\qoder_proxy.py` …），python 直接报找不到文件。
+  现在：
+  - 用 `[char]34` 拼出双引号（避开 bat / PowerShell 双重转义），脚本与 pid 路径都作为**单个带引号参数**传入；
+  - 路径经环境变量（`$env:QD_SCRIPT` 等）传入，避开 `&`、`^` 这类 cmd 元字符；
+  - 日志重定向同样用变量，空格路径不再出错；
+  - `-WindowStyle Hidden` / `-PassThru` / `--pid-file` 语义不变（#50 行为不变）。
+
+  实测：在 `...\my project\qoder proxy\` 这种双层空格目录下启动，桩脚本收到的 argv 为 `['…\qoder proxy\qoder_proxy.py', '--port', '18766', '--pid-file', '…\qoder-proxy.pid']`，参数完整未拆分。
+
+**验证**：新增 `tests/_test_issue85_bat_spaces.py`（9 条：源码守卫 + ASCII-only + 真实带空格目录端到端）；全量 **65 suites / 1851 checks / 0 failed**。
+
 ## v1.6.9
 
 **🐛 问题修复（国际版签到不可用 + 无提示）**
