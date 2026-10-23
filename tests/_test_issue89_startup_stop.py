@@ -60,47 +60,65 @@ check("stop.sh 先 TERM 再 KILL", "kill -TERM" in _stop and "kill -KILL" in _st
 check("stop.sh 拒绝杀非 qoder-proxy 进程", "refusing to stop" in _stop)
 check("stop.sh 无 pid 文件时按端口+进程名兜底",
       '--port $PORT' in _stop)
-for _sh, _name in ((_start, "start"), (_stop, "stop")):
-    _r = subprocess.run(["bash", "-n", "-"], input=_sh, capture_output=True,
-                        text=True)
-    check("%s.sh 语法有效" % _name, _r.returncode == 0, (_r.stderr or "")[:160])
+_bash = shutil.which("bash")
+if not _bash:
+    print("  [skip] no bash - syntax check skipped")
+else:
+    for _sh, _name in ((_start, "start"), (_stop, "stop")):
+        _f = os.path.join(tempfile.mkdtemp(prefix="shsyn-"), _name + ".sh")
+        io.open(_f, "w", encoding="utf-8").write(_sh)
+        _r = subprocess.run([_bash, "-n", _f], capture_output=True, text=True)
+        check("%s.sh syntax ok" % _name, _r.returncode == 0, (_r.stderr or "")[:160])
 
-print("[#89] 端到端（仅 POSIX：Windows 的 kill 与 Windows 进程不互通）")
+print("[#89] 端到端（仅 Linux：Windows 的 kill 与 Windows 进程不互通）")
 if not sys.platform.startswith("linux"):
     print("  [skip] 非 Linux 环境跳过真实启停")
 else:
-    _tmp = tempfile.mkdtemp(prefix="sh89-")
-    for _f in ("start-qoder-proxy.sh", "stop-qoder-proxy.sh"):
-        shutil.copy2(os.path.join(ROOT, _f), _tmp)
-    io.open(os.path.join(_tmp, "qoder_proxy.py"), "w", encoding="utf-8").write(
-        "import time\ntime.sleep(120)\n")
-    _env = dict(os.environ, QD_PROXY_PYTHON=sys.executable)
-    _env.pop("HTTPS_PROXY", None)
-    _env.pop("HTTP_PROXY", None)
-    subprocess.Popen(["bash", "-c",
-                      "cd %s && ./start-qoder-proxy.sh 18797 > start.log 2>&1 &"
-                      % _tmp])
-    _pidfile = os.path.join(_tmp, "qoder-proxy.pid")
-    _pid = ""
-    for _ in range(30):
-        time.sleep(0.5)
-        if os.path.exists(_pidfile):
-            _pid = io.open(_pidfile).read().strip()
-            if _pid:
-                break
-    check("start.sh 写出 pid 文件", bool(_pid), _pid)
-    _stop_r = subprocess.run(["bash", "-c",
-                              "cd %s && ./stop-qoder-proxy.sh 18797" % _tmp],
-                             capture_output=True, text=True, timeout=60)
-    time.sleep(1.0)
-    _alive = True
-    if _pid:
-        try:
-            os.kill(int(_pid), 0)
-            _alive = True
-        except Exception:
-            _alive = False
-    check("stop.sh 停掉进程", _alive is False, (_pid, _stop_r.stdout[:80]))
-    check("stop.sh 清掉 pid 文件", not os.path.exists(_pidfile))
+    import http.client
 
+    _tmp = tempfile.mkdtemp(prefix="sh89-")
+    shutil.copy2(os.path.join(ROOT, "stop-qoder-proxy.sh"), _tmp)
+    _pidfile = os.path.join(_tmp, "qoder-proxy.pid")
+    _env = dict(os.environ)
+    for _k in ("HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "no_proxy"):
+        _env.pop(_k, None)
+    _env["ACCOUNTS_DIR"] = os.path.join(_tmp, "accounts")
+    _env["QD_NO_PAUSE"] = "1"
+    _proc = subprocess.Popen(
+        [sys.executable, os.path.join(ROOT, "qoder_proxy.py"),
+         "--port", "18797", "--pid-file", _pidfile],
+        cwd=ROOT, env=_env, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL)
+    _up = False
+    for _ in range(40):
+        time.sleep(0.5)
+        try:
+            _c = http.client.HTTPConnection("127.0.0.1", 18797, timeout=2)
+            _c.request("GET", "/ping")
+            if _c.getresponse().status == 200:
+                _up = True
+                break
+        except Exception:
+            pass
+    check("服务端成功监听", _up)
+    _pid = ""
+    if os.path.exists(_pidfile):
+        _pid = io.open(_pidfile).read().strip()
+    check("服务端写出 pid 文件且内容为自身 PID",
+          _pid.isdigit() and int(_pid) == _proc.pid, (_pid, _proc.pid))
+    _bash = shutil.which("bash") or "bash"
+    _stop_r = subprocess.run(
+        [_bash, "-c", "cd %s && ./stop-qoder-proxy.sh 18797" % _tmp],
+        capture_output=True, text=True, timeout=60)
+    _gone = False
+    for _ in range(30):
+        if _proc.poll() is not None:
+            _gone = True
+            break
+        time.sleep(0.5)
+    check("stop.sh 停掉进程", _gone,
+          ((_stop_r.stdout or "")[:150], (_stop_r.stderr or "")[:150]))
+    check("stop.sh 清掉 pid 文件", not os.path.exists(_pidfile))
+    if _proc.poll() is None:
+        _proc.kill()
 finish()
