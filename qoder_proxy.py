@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -1818,6 +1818,224 @@ def _usage_daily_uncached(days, group, realm, since):
         "totals": totals,
     }
 
+
+
+# ---------------------------------------------------------------------------
+# 统计概览（新版数据看板）：一次扫描产出 KPI / Top 榜 / 热力图 / 缓存 / 24h 曲线
+# ---------------------------------------------------------------------------
+# compute_usage_stats 的形参名是 range（与 /usage/* 的查询参数同名），
+# 会遮蔽内建 range —— 在模块层先留一个别名，函数内一律用它。
+_RNG = range
+
+_PROVIDER_RULES = (
+    ("claude", "Anthropic"), ("anthropic", "Anthropic"), ("haiku", "Anthropic"),
+    ("sonnet", "Anthropic"), ("opus", "Anthropic"),
+    ("gpt", "OpenAI"), ("openai", "OpenAI"), ("o1", "OpenAI"), ("o3", "OpenAI"),
+    ("o4", "OpenAI"), ("davinci", "OpenAI"),
+    ("gemini", "Google"), ("gemma", "Google"), ("palm", "Google"),
+    ("qwen", "通义千问"), ("qwq", "通义千问"), ("tongyi", "通义千问"),
+    ("deepseek", "DeepSeek"), ("dfmodel", "DeepSeek"), ("df-", "DeepSeek"),
+    ("glm", "智谱 GLM"), ("chatglm", "智谱 GLM"),
+    ("kimi", "月之暗面"), ("moonshot", "月之暗面"),
+    ("llama", "Meta"), ("mistral", "Mistral"), ("mixtral", "Mistral"),
+    ("grok", "xAI"), ("doubao", "豆包"), ("ernie", "文心一言"), ("spark", "讯飞星火"),
+    ("hunyuan", "腾讯混元"), ("minimax", "MiniMax"), ("abab", "MiniMax"),
+)
+
+
+def provider_of(model):
+    """模型 -> 上游厂商（面板「提供商」维度用；未知归「其他」）。"""
+    m = str(model or "").lower()
+    for key, name in _PROVIDER_RULES:
+        if key in m:
+            return name
+    return "其他"
+
+
+def _day_key(ts):
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+    except Exception:
+        return ""
+
+
+def compute_usage_stats(range=None, since=None, until=None,
+                        heatmap_days=365, top_n=5):
+    """统计概览页所需的全部数据（单次扫描 usage.jsonl）。
+
+    窗口语义与 /usage/analytics 一致（range_window）：today/week/month/custom/空=全部。
+    热力图固定看最近 heatmap_days 个本地自然日，与窗口无关；窗口只影响 KPI/Top/趋势。
+    """
+    now = time.time()
+    lo, hi = range_window(range, since, until)
+    today_start = _local_midnight()
+    heat_lo = _local_midnight(days_back=max(1, int(heatmap_days)) - 1)
+
+    tot = {"requests": 0, "errors": 0, "tokens": 0,
+           "prompt": 0, "completion": 0, "cached": 0}
+    models = {}       # model -> {"tokens","requests"}
+    accounts = {}     # account -> {"tokens","requests"}
+    providers = {}    # provider -> {"tokens","requests"}
+    heat = {}         # "YYYY-MM-DD" -> tokens
+    act_days = set()  # 窗口内活跃日（本地日期）
+    all_days = set()  # 全年活跃日（连续性计算用）
+    cache_win = {"10m": [0, 0], "1h": [0, 0], "24h": [0, 0], "7d": [0, 0]}
+    hour_cached = [0] * 24
+    hour_prompt = [0] * 24
+    hour_tokens = [0] * 24
+
+    def _bump(bucket, key, tokens, reqs=1):
+        cell = bucket.get(key)
+        if cell is None:
+            cell = bucket[key] = {"tokens": 0, "requests": 0}
+        cell["tokens"] += tokens
+        cell["requests"] += reqs
+
+    if os.path.exists(USAGE_LOG):
+        try:
+            with open(USAGE_LOG, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    at = r.get("at") or 0
+                    try:
+                        at = float(at)
+                    except (TypeError, ValueError):
+                        at = 0.0
+                    prompt = int(r.get("prompt_tokens") or 0)
+                    cached = int(r.get("cached_tokens") or 0)
+                    tokens = int(r.get("total_tokens") or 0)
+                    is_err = bool(r.get("error"))
+                    dkey = _day_key(at)
+                    # 热力图与活跃日：全年范围（不按窗口过滤）
+                    if at >= heat_lo and dkey:
+                        if not is_err and tokens:
+                            heat[dkey] = heat.get(dkey, 0) + tokens
+                        all_days.add(dkey)
+                    # 缓存三窗口：按「现在」回溯（与窗口无关）
+                    if not is_err and prompt > 0:
+                        for _k, _secs in (("10m", 600), ("1h", 3600),
+                                          ("24h", 86400), ("7d", 604800)):
+                            if at >= now - _secs:
+                                cache_win[_k][0] += cached
+                                cache_win[_k][1] += prompt
+                    # 24 小时曲线：按本地整点
+                    if at >= now - 86400 and not is_err:
+                        hour = time.localtime(at).tm_hour
+                        hour_cached[hour] += cached
+                        hour_prompt[hour] += prompt
+                        hour_tokens[hour] += tokens
+                    if not _row_in_window(r, lo, hi):
+                        continue
+                    if dkey:
+                        act_days.add(dkey)
+                    if is_err:
+                        tot["errors"] += 1
+                        continue
+                    tot["requests"] += 1
+                    tot["tokens"] += tokens
+                    tot["prompt"] += prompt
+                    tot["completion"] += int(r.get("completion_tokens") or 0)
+                    tot["cached"] += cached
+                    m = r.get("model") or "(unknown)"
+                    _bump(models, m, tokens)
+                    _bump(accounts, r.get("account") or "(unattributed)", tokens)
+                    _bump(providers, provider_of(m), tokens)
+        except Exception as exc:
+            log("compute_usage_stats failed: %s" % exc, level="WARN", tag="usage")
+
+    _nick = {}
+    try:
+        if POOL:
+            for _a in POOL.accounts:
+                _nick[_a.uid] = _a.nickname or _a.uid[:8]
+    except Exception:
+        _nick = {}
+
+    def _rank(bucket, limit=None):
+        rows = sorted(bucket.items(), key=lambda kv: kv[1]["tokens"], reverse=True)
+        if limit:
+            rows = rows[:limit]
+        total = sum(v["tokens"] for _, v in rows) or 1
+        return [{"name": _nick.get(k) or k, "key": k, "tokens": v["tokens"], "requests": v["requests"],
+                 "share": round(v["tokens"] * 100.0 / total, 2)}
+                for k, v in rows]
+
+    # 连续天数：从今天（或昨天）往回数全年活跃日
+    streak = 0
+    if all_days:
+        probe = time.localtime()
+        # 今天没有请求时从昨天开始数（今天还没过完，不该中断）
+        if _day_key(now) not in all_days:
+            probe = time.localtime(now - 86400)
+        while True:
+            d = time.strftime("%Y-%m-%d", probe)
+            if d not in all_days:
+                break
+            streak += 1
+            probe = time.localtime(time.mktime(probe[:3] + (0, 0, 0, 0, 0, -1)) - 86400)
+
+    top_models = _rank(models)
+    hours = []
+    for i in _RNG(23, -1, -1):
+        ts = now - i * 3600
+        h = time.localtime(ts).tm_hour
+        prompt = hour_prompt[h]
+        cached = hour_cached[h]
+        hours.append({
+            "ts": int(ts),
+            "label": time.strftime("%H:00", time.localtime(ts)),
+            "pct": (round(cached * 100.0 / prompt, 2) if prompt else None),
+            "tokens": hour_tokens[h],
+        })
+
+    cache_rows = []
+    for _k, _label in (("10m", "近 10 分钟"), ("1h", "近 1 小时"),
+                       ("24h", "近 24 小时"), ("7d", "近 7 天")):
+        hit, inp = cache_win[_k]
+        cache_rows.append({"key": _k, "label": _label, "hit": hit, "input": inp,
+                           "pct": (round(hit * 100.0 / inp, 1) if inp else None)})
+
+    heat_days = []
+    start = time.localtime(heat_lo)
+    cursor = time.mktime((start.tm_year, start.tm_mon, start.tm_mday,
+                          0, 0, 0, 0, 0, -1))
+    while cursor <= now:
+        d = _day_key(cursor)
+        heat_days.append({"date": d, "tokens": heat.get(d, 0)})
+        cursor += 86400
+
+    return {
+        "window": {"from": lo, "to": hi, "range": str(range or "all")},
+        "kpi": {
+            "requests": tot["requests"],
+            "success": tot["requests"],
+            "errors": tot["errors"],
+            "success_pct": (round(tot["requests"] * 100.0 /
+                                  (tot["requests"] + tot["errors"]), 2)
+                            if (tot["requests"] + tot["errors"]) else None),
+            "tokens": tot["tokens"],
+            "prompt": tot["prompt"],
+            "completion": tot["completion"],
+            "cached": tot["cached"],
+            "active_days": len(act_days),
+            "streak_days": streak,
+            "top_model": (top_models[0] if top_models else None),
+        },
+        "top_accounts": _rank(accounts, top_n),
+        "top_providers": _rank(providers, top_n),
+        "models": _rank(models, 10),
+        "providers": _rank(providers, 10),
+        "cache": {"windows": cache_rows},
+        "hourly": {"points": hours},
+        "heatmap": {"days": heat_days,
+                     "max": max([d["tokens"] for d in heat_days] or [0])},
+    }
 
 def compute_usage_analytics(range=None, since=None, until=None):
     """Detailed analytics for Token, Cache, and Reasoning metrics page.
@@ -8916,6 +9134,13 @@ class Handler(BaseHTTPRequestHandler):
             # 输出与改动前逐字节一致；语义见 range_window）
             req_range, req_since, req_until = range_query(query)
             return self._json(200, compute_usage_analytics(
+                range=req_range, since=req_since, until=req_until))
+        if path == "/usage/stats":
+            # 统计概览（新版数据看板）：KPI / Top 榜 / 热力图 / 缓存 / 24h 曲线一次取回
+            if not self._authorized():
+                return
+            req_range, req_since, req_until = range_query(query)
+            return self._json(200, compute_usage_stats(
                 range=req_range, since=req_since, until=req_until))
         if path == "/usage/by-account":
             if not self._authorized():
