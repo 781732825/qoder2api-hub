@@ -108,7 +108,7 @@ else:
           _pid.isdigit() and int(_pid) == _proc.pid, (_pid, _proc.pid))
     _bash = shutil.which("bash") or "bash"
     _stop_r = subprocess.run(
-        [_bash, "-c", "cd %s && ./stop-qoder-proxy.sh 18797" % _tmp],
+        [_bash, "-c", "cd %s && bash stop-qoder-proxy.sh 18797" % _tmp],
         capture_output=True, text=True, timeout=60)
     _gone = False
     for _ in range(30):
