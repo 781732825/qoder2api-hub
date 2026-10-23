@@ -110,8 +110,8 @@ check("统计接口已挂路由", "/usage/stats" in io.open(
       os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read())
 
 print("[stats] 目录/关键词")
-check("pageNavSections 会跳过 .hint（侧栏标签不带 ?）",
-      "clone.querySelectorAll('em, .hint')" in _dash)
+check("pageNavSections 会跳过 .hint-icon（侧栏标签不带 ?）",
+      "clone.querySelectorAll('em, .hint-icon')" in _dash)
 check("boot 对每步容错（否则页签初始化会被跳过）",
       "boot step failed:" in _dash)
 
