@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.12"
+VERSION = "1.6.13"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -4498,6 +4498,7 @@ def _recover_leaked_tool_calls_inner(frames, allowed_names=None):
         calls, clean = parse_leaked_tool_calls(hold, allowed_names)
         if calls:
             recovered = True
+            RECOVERY_STATS["leak"] = RECOVERY_STATS.get("leak", 0) + 1
             for i, call in enumerate(calls):
                 yield _leak_chunk_frame(meta, {"tool_calls": [{
                     "index": i,
@@ -4662,6 +4663,7 @@ def _sse_recover_dsml(frames, allowed_names=None):
                 clean = _lclean
         if calls:
             recovered = True
+            RECOVERY_STATS["dsml"] = RECOVERY_STATS.get("dsml", 0) + 1
             if clean:
                 yield _leak_chunk_frame(meta, {"content": clean})
             for i, call in enumerate(calls):
@@ -5362,10 +5364,139 @@ QUEUE_WAIT_MAX_SECS = int(os.environ.get("QD_QUEUE_WAIT_MAX_SECS") or 180)
 QUEUE_WAIT_BUDGET_SECS = int(os.environ.get("QD_QUEUE_WAIT_BUDGET_SECS") or 600)
 QUEUE_WAIT_JITTER_SECS = float(os.environ.get("QD_QUEUE_WAIT_JITTER") or 2.0)
 
+# issue #87：排队「可见」还是「快速失败」——
+#   visible（默认）：流式请求**先发响应头**，排队期间持续发心跳 + 排队提示帧，
+#                    客户端能看到「上游排队中（已等待 Ns）」；超预算发中文错误帧；
+#   fast          ：不等，立即 503 + Retry-After + 中文原因（客户端自己重试）；
+#   wait          ：旧行为（在 open_upstream 内静默 sleep，客户端零字节——就是
+#                    「卡住」的来源，保留仅为兼容）。
+QUEUE_MODE = (os.environ.get("QD_QUEUE_WAIT_MODE") or "visible").strip().lower()
+if QUEUE_MODE not in ("visible", "fast", "wait"):
+    QUEUE_MODE = "visible"
+
+
+def queue_mode():
+    """当前排队策略（visible / fast / wait）。"""
+    return QUEUE_MODE
+
+
+QUEUE_MSG_WAIT_ZH = "上游模型排队中（10605 / RESOURCE_LIMIT）：已等待 %d 秒，仍在队列中"
+QUEUE_MSG_FAIL_ZH = ("上游模型排队超时（已等待 %d 秒，上限 %d 秒）：请稍后重试，"
+                     "或换一个模型/区域。这不是你的 Key、账号或网络问题。")
+
+
+def visible_queue_acquire(seed_exc, reopen, emit, budget_secs=None, started=None):
+    """visible 模式（issue #87）：在**已建立的流**里等待排队并持续报告进度。
+
+    - emit("queue", info)   ：每轮发一次排队状态（客户端可见「已等待 Ns」）
+    - emit("timeout", info) ：超出预算，info 里有中文原因
+    - emit("error", info)   ：排队后重试遇到其它错误
+    返回 reopen() 的结果；超预算或失败返回 None（调用方负责收尾）。
+    """
+    budget = int(QUEUE_WAIT_BUDGET_SECS if budget_secs is None else budget_secs)
+    start = (time.time() - float(getattr(seed_exc, "waited", 0) or 0)
+             if started is None else started)
+    exc = seed_exc
+    while True:
+        waited = int(max(0, time.time() - start))
+        emit("queue", {"queued": True, "waited_seconds": waited,
+                       "wait_seconds": int(exc.retry_after),
+                       "budget_seconds": budget,
+                       "message": QUEUE_MSG_WAIT_ZH % waited})
+        if time.time() + exc.retry_after > start + budget:
+            emit("timeout", {"waited_seconds": waited, "budget_seconds": budget,
+                             "code": "upstream_queued",
+                             "message": QUEUE_MSG_FAIL_ZH % (waited, budget)})
+            return None
+        time.sleep(min(int(exc.retry_after), 60) + 1
+                   + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
+        try:
+            return reopen()
+        except UpstreamQueued as exc2:
+            exc = exc2
+        except Exception as exc3:
+            emit("error", {"message": "排队等待后重试失败：%s" % str(exc3)[:160],
+                           "code": "upstream_queued_retry_failed"})
+            return None
+
+
+class UpstreamQueued(UpstreamStatus):
+    """上游 10605 排队（issue #87）。
+
+    携带 retryAfterSeconds，供 fast（立即返回 503）与 visible（流内等待）使用；
+    继承 UpstreamStatus 以保证既有 except 分支不会把它当未知错误。
+    """
+
+    def __init__(self, retry_after, detail="", waited=0):
+        retry_after = int(retry_after or 0)
+        # 503 而不是 403：排队是「暂时不可用」，客户端应当重试而不是放弃
+        super(UpstreamQueued, self).__init__(503, detail or "10605 queued")
+        self.retry_after = max(1, retry_after)
+        self.detail = detail or ""
+        self.waited = int(waited)
+
+
+
+_QUALITY_CACHE = {"at": 0.0, "data": None}
+
+
+def quality_snapshot(limit=500, ttl=30.0):
+    """面板质量指标（issue #87）：TTFT p50/p90、输出速度、排队率、回读命中。
+
+    数据来自 usage/usage.jsonl 尾部（跳过没有 account 的测试夹具行），
+    30 秒缓存，避免面板轮询把 JSON 解析做满。
+    """
+    now = time.time()
+    if _QUALITY_CACHE["data"] and now - _QUALITY_CACHE["at"] < ttl:
+        return _QUALITY_CACHE["data"]
+    ttfts, tps = [], []
+    rows = 0
+    try:
+        with open(USAGE_LOG, encoding="utf-8", errors="ignore") as fh:
+            tail = fh.readlines()[-limit:]
+        for line in tail:
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if not r.get("account"):
+                continue          # 测试夹具 / 无账号行不计入
+            rows += 1
+            if isinstance(r.get("ttft_ms"), (int, float)):
+                ttfts.append(float(r["ttft_ms"]))
+            if r.get("completion_tokens") and r.get("gen_ms"):
+                tps.append(float(r["completion_tokens"])
+                           / max(0.001, float(r["gen_ms"]) / 1000.0))
+    except Exception:
+        pass
+
+    def _pct(values, p):
+        if not values:
+            return None
+        values = sorted(values)
+        return round(values[min(len(values) - 1, int(len(values) * p))], 1)
+
+    data = {
+        "requests": rows,
+        "ttft_p50_ms": _pct(ttfts, 0.5),
+        "ttft_p90_ms": _pct(ttfts, 0.9),
+        "tps_p50": round(tps and sorted(tps)[len(tps) // 2], 1) if tps else None,
+        "queue_total": int(RISK_STATS.get("queue") or 0),
+        "queue_rate": (round((RISK_STATS.get("queue") or 0) / rows, 4)
+                       if rows else None),
+        "recovery": {"leak": int(RECOVERY_STATS.get("leak") or 0),
+                     "dsml": int(RECOVERY_STATS.get("dsml") or 0)},
+        "queue_mode": queue_mode(),
+    }
+    _QUALITY_CACHE.update({"at": now, "data": data})
+    return data
+
 
 # issue #64：风控/排队信号计数（只读观测，供 /health 与面板排查）。
 RISK_STATS = {"queue": 0, "rate": 0, "rejected": 0, "version_gate": 0,
               "last": None}
+# issue #87：回读命中计数（面板「回读命中率」用）——leak=文本复述、dsml=原生标记
+RECOVERY_STATS = {"leak": 0, "dsml": 0}
 _RISK_LOCK = threading.Lock()
 
 
@@ -5574,6 +5705,12 @@ def friendly_upstream_error(code, detail):
         code_i = int(code)
     except Exception:
         code_i = 502
+    # issue #87：排队（fast 模式在这里统一给出中文原因，所有入口共用）
+    if ("10605" in detail or "isQueued" in detail
+            or "RESOURCE_LIMIT" in detail) and _to_int_status(code) in (403, 503):
+        return ("上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，"
+                "或换一个模型/区域。这不是你的 Key、账号或网络问题。"
+                "上游详情：%s" % (detail[:160] or "(无详情)"), "upstream_queued")
     # issue #64：版本过低是硬门控（官方客户端会自己升级，网关只能提示）
     if "430" in str(code):
         return ("客户端/网关版本过低（430）：上游要求升级后才能继续。"
@@ -6156,7 +6293,7 @@ def _chat_chunks_iter(obj, model):
 
 
 def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
-                  only_account=None):
+                  only_account=None, on_queue=None):
     """构造 COSY 签名请求并打开上游 SSE。返回 (resp, account, encoded)。
 
     usage_ctx：可选**出参** dict。传入时回填本次请求的推理档位审计信息
@@ -6312,10 +6449,28 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
                 # 交给客户端）。仅在预算与单轮上限内等待；超出即按原错误走
                 # 既有分类（fail-open 语义不变）。
                 qwait = _queue_wait_seconds(detail)
-                if qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS \
-                        and qwait <= QUEUE_WAIT_MAX_SECS \
-                        and (time.time() - queue_start) + qwait \
-                        <= QUEUE_WAIT_BUDGET_SECS:
+                _can_wait = (qwait > 0 and queue_tries < QUEUE_MAX_ROUNDS
+                             and qwait <= QUEUE_WAIT_MAX_SECS
+                             and (time.time() - queue_start) + qwait
+                             <= QUEUE_WAIT_BUDGET_SECS)
+                # issue #87：visible 模式由调用方（流式 handler）提供 on_queue，
+                # 它在**流内**发心跳+排队提示；fast 模式直接抛给 handler 返回 503。
+                if _can_wait and on_queue is not None:
+                    queue_tries += 1
+                    log("upstream queued on '%s' model '%s' - waiting %ds "
+                        "(round %d/%d, visible)"
+                        % (account.uid[:8], model, qwait, queue_tries,
+                           QUEUE_MAX_ROUNDS), level="WARN", tag="chat")
+                    try:
+                        on_queue(qwait, detail, queue_tries, QUEUE_MAX_ROUNDS)
+                    except Exception:
+                        pass
+                    time.sleep(qwait + 1 + random.uniform(0, QUEUE_WAIT_JITTER_SECS))
+                    continue
+                if qwait > 0 and queue_mode() != "wait":
+                    raise UpstreamQueued(qwait, detail,
+                                         int(time.time() - queue_start))
+                if _can_wait:
                     queue_tries += 1
                     log("upstream queued on '%s' model '%s' - waiting %ds "
                         "(round %d/%d)"
@@ -7083,6 +7238,28 @@ def _unwrap_custom_input(args):
     return args
 
 
+_RESPONSES_IGNORED_ONCE = set()
+
+
+def _note_ignored_responses(payload):
+    """issue #87：把当前**未实现**的 Responses 专有字段显式记下来。
+
+    客户端（Codex 等）会带 store / previous_response_id / include / text 等字段，
+    我们目前按「无状态 + 全量历史」处理。静默忽略会让排查毫无线索，这里每个
+    字段只告警一次（不改变行为，只是让现象可解释）。
+    """
+    try:
+        for key in ("store", "previous_response_id", "include", "text",
+                    "truncation", "metadata", "service_tier", "background"):
+            if payload.get(key) is None or key in _RESPONSES_IGNORED_ONCE:
+                continue
+            _RESPONSES_IGNORED_ONCE.add(key)
+            log("responses: field %r is not implemented - ignored (issue #87)"
+                % key, level="WARN", tag="chat")
+    except Exception:
+        pass
+
+
 def responses_to_chat(payload):
     """Translate a Responses API request body into a Chat Completions body."""
     messages = []
@@ -7258,6 +7435,12 @@ def responses_to_chat(payload):
         chat["tool_choice"] = payload["tool_choice"]
     if payload.get("parallel_tool_calls") is not None:
         chat["parallel_tool_calls"] = payload["parallel_tool_calls"]
+    else:
+        # Responses 语义默认允许并行工具调用（显式传出，避免上游按串行处理）
+        chat["parallel_tool_calls"] = True
+    if isinstance(payload.get("stream_options"), dict):
+        chat["stream_options"] = payload["stream_options"]
+    _note_ignored_responses(payload)
     return chat
 
 
@@ -7898,6 +8081,8 @@ class Handler(BaseHTTPRequestHandler):
         “一直重连 / 连不上”。改为 chunked 后，流结束发 0 长度的终止块，
         连接保持 keep-alive，可安全复用。
         """
+        if getattr(self, "_chunked", False):
+            return          # 幂等：排队可视化会提前开流，后续调用不能重复发头
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -7939,9 +8124,63 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self._chunked = False
 
-    def _json(self, code, obj):
+    def _queue_notice(self, flavor, info):
+        """排队提示帧（issue #87 visible 模式）。
+
+        先用 SSE 注释心跳保活，再发一条**客户端可读**的排队状态：
+        chat 走 `qoder_queue` 字段；responses 走 `response.qoder_queue` 事件；
+        anthropic 走 `ping` 事件（带 qoder_queue 附加字段，客户端会忽略未知键）。
+        """
+        self._sse_write(b": ping\n\n")
+        body = json.dumps(info, ensure_ascii=False)
+        if flavor == "anthropic":
+            self._sse_write(("event: ping\ndata: "
+                             + json.dumps({"type": "ping", "qoder_queue": info},
+                                          ensure_ascii=False) + "\n\n").encode("utf-8"))
+        elif flavor == "responses":
+            self._sse_write(("event: response.qoder_queue\ndata: "
+                             + json.dumps({"type": "response.qoder_queue",
+                                           "sequence_number": 0,
+                                           "qoder_queue": info},
+                                          ensure_ascii=False) + "\n\n").encode("utf-8"))
+        else:
+            self._sse_write(("data: " + json.dumps(
+                {"id": "chatcmpl-qoder-queue",
+                 "object": "chat.completion.chunk",
+                 "created": int(time.time()),
+                 "model": info.get("model") or "",
+                 "choices": [{"index": 0, "delta": {"content": ""},
+                              "finish_reason": None}],
+                 "qoder_queue": info}, ensure_ascii=False) + "\n\n").encode("utf-8"))
+
+    def _queue_error_frame(self, flavor, message, waited, budget):
+        """排队超预算（visible 模式）：给明确的中文错误，而不是静默断开。"""
+        info = {"message": message, "waited_seconds": int(waited),
+                "budget_seconds": int(budget), "code": "upstream_queued"}
+        if flavor == "anthropic":
+            self._sse_write(("event: error\ndata: " + json.dumps(
+                {"type": "error", "error": {"type": "overloaded_error",
+                                            "message": message},
+                 "qoder_queue": info}, ensure_ascii=False) + "\n\n").encode("utf-8"))
+        elif flavor == "responses":
+            self._sse_write(("event: response.failed\ndata: " + json.dumps(
+                {"type": "response.failed",
+                 "response": {"status": "failed",
+                              "error": {"code": "upstream_queued",
+                                        "message": message}},
+                 "qoder_queue": info}, ensure_ascii=False) + "\n\n").encode("utf-8"))
+        else:
+            self._sse_write(("data: " + json.dumps(
+                {"error": {"message": message, "type": "upstream_queued",
+                           "code": 503}, "qoder_queue": info},
+                ensure_ascii=False) + "\n\n").encode("utf-8"))
+            self._sse_write(b"data: [DONE]\n\n")
+
+    def _json(self, code, obj, extra_headers=None):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
+        for _k, _v in (extra_headers or {}).items():
+            self.send_header(str(_k), str(_v))
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         realm_used = getattr(self, "realm_used", "") or ""
@@ -7956,9 +8195,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _error(self, code, message, err_type="server_error"):
+    def _error(self, code, message, err_type="server_error", retry_after=None):
+        extra = {"Retry-After": int(retry_after)} if retry_after else None
         self._json(code, {"error": {"message": message, "type": err_type,
-                                    "code": code}})
+                                    "code": code}}, extra_headers=extra)
 
     def _unknown_path_error(self, path):
         """404，并针对最常见的「接入地址填错」给出可执行提示。
@@ -8307,6 +8547,7 @@ class Handler(BaseHTTPRequestHandler):
                 "api_key_required": bool(API_KEY),
                 "risk": risk_snapshot(),
                 "env": env_report(),
+                "quality": quality_snapshot(),
             }
             if self._key_ok():
                 info.update({
@@ -9681,6 +9922,38 @@ class Handler(BaseHTTPRequestHandler):
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
+        except UpstreamQueued as exc:
+            # issue #87：排队——visible 在流内等待并持续报告进度；
+            # fast / 非流式直接 503 + Retry-After + 中文原因。
+            _msg, _et = friendly_upstream_error(503, exc.detail)
+            if not want_stream or queue_mode() != "visible":
+                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+            self._sse_begin()
+            _q0 = time.time()
+
+            def _emit_q(kind, info):
+                info = dict(info or {})
+                info["model"] = chat_req.get("model") or ""
+                if kind == "queue":
+                    self._queue_notice("responses", info)
+                else:
+                    self._queue_error_frame(
+                        "responses", info.get("message") or _msg,
+                        info.get("waited_seconds") or int(time.time() - _q0),
+                        info.get("budget_seconds") or QUEUE_WAIT_BUDGET_SECS)
+
+            _got = visible_queue_acquire(
+                exc,
+                lambda: open_upstream(chat_req, session_key=session_key,
+                                      target_realm=req_realm,
+                                      usage_ctx=usage_ctx),
+                _emit_q, started=_q0)
+            if _got is None:
+                self._sse_end()
+                return
+            upstream, account, _ = _got
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:
             t = time.time() - t_start
             record_error(model, 429, exc.detail[:200],
@@ -9750,9 +10023,14 @@ class Handler(BaseHTTPRequestHandler):
                                     _c["n"] += 1
                                     yield item
 
+                            # issue #87：Responses 与 chat 走**同一条**回读链
+                            # （此前只有 chat/Anthropic 有，Codex 侧泄漏型工具
+                            # 调用只能等流末才被解析出来）。
                             inner = _count_src(
                                 sse_with_heartbeat(
-                                    iter_inner_sse(cur, holder=holder),
+                                    recover_leaked_tool_calls(
+                                        iter_inner_sse(cur, holder=holder),
+                                        allowed_names=_tool_names_from_payload(chat_req)),
                                     self._sse_write))
                             for frame in stream_responses_events(inner, model, holder):
                                 if first_ms is None:
@@ -10107,6 +10385,38 @@ class Handler(BaseHTTPRequestHandler):
                                                  target_realm=req_realm,
                                                  usage_ctx=usage_ctx)
             # #26：记录实际出口（自动路由后可能与 req_realm 不同）→ 响应头可见
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
+        except UpstreamQueued as exc:
+            # issue #87：排队——visible 在流内等待并持续报告进度；
+            # fast / 非流式给 503 + Retry-After + 中文原因。
+            _msg, _et = friendly_upstream_error(503, exc.detail)
+            if not want_stream or queue_mode() != "visible":
+                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+            self._sse_begin()
+            _q0 = time.time()
+
+            def _emit_q(kind, info):
+                info = dict(info or {})
+                info["model"] = model
+                if kind == "queue":
+                    self._queue_notice("chat", info)
+                else:
+                    self._queue_error_frame(
+                        "chat", info.get("message") or _msg,
+                        info.get("waited_seconds") or int(time.time() - _q0),
+                        info.get("budget_seconds") or QUEUE_WAIT_BUDGET_SECS)
+
+            _got = visible_queue_acquire(
+                exc,
+                lambda: open_upstream(payload, session_key=session_key,
+                                      target_realm=req_realm,
+                                      usage_ctx=usage_ctx),
+                _emit_q, started=_q0)
+            if _got is None:
+                self._sse_end()
+                return
+            upstream, account, _ = _got
             self.realm_used = usage_ctx.get("realm") or req_realm
             self.realm_reason = usage_ctx.get("realm_reason") or ""
         except RateLimited as exc:

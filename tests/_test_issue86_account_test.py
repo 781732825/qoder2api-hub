@@ -13,8 +13,8 @@ declare_suite(__file__, ["qoder_proxy.py"])
 
 print("[#86] 源码守卫")
 _src = io.open(os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read()
-check("open_upstream 有 only_account 参数",
-      "usage_ctx=None,\n                  only_account=None):" in _src)
+check("open_upstream 有 only_account 参数（#87 起还带 on_queue）",
+      "usage_ctx=None,\n                  only_account=None, on_queue=None):" in _src)
 check("选取账号时优先用钉死账号",
       "account = only_account if only_account.uid not in tried else None" in _src)
 check("钉死时按单账号池处理（total=1）",

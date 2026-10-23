@@ -1022,6 +1022,11 @@ button.page-nav-top:hover{background:var(--panel2);border-color:var(--accent);co
         <div class="v" id="kpiTotalTokens">0</div>
         <div class="s" id="kpiTotalTokensDetail">输入 0 · 输出 0</div>
       </div>
+      <div class="card" title="首字延迟与排队/回读质量（issue #87）">
+        <div class="k">首字延迟 / 排队</div>
+        <div class="v" id="kpiTTFT">-</div>
+        <div class="s" id="kpiQualityDetail">等待数据</div>
+      </div>
       <div class="card accent2">
         <div class="k">网关平均生成速度</div>
         <div class="v" id="kpiAvgSpeed">0.0 <span style="font-size:12px;font-weight:400;color:var(--dim)">tok/s</span></div>
@@ -5820,12 +5825,35 @@ function renderDailyChart(d){
   }
 }
 
+async function loadQuality(){
+  // issue #87：TTFT p50/p90、排队率、回读命中（来自 /health.quality）
+  try{
+    const h = await getJSON('/health');
+    const q = (h && h.quality) || {};
+    const el = document.getElementById('kpiTTFT');
+    const det = document.getElementById('kpiQualityDetail');
+    const fmtSec = v => (v == null ? '-' : (v/1000).toFixed(1) + ' s');
+    if(el){
+      el.innerHTML = fmtSec(q.ttft_p50_ms) +
+        '<span style="font-size:12px;font-weight:400;color:var(--dim)"> p50 / p90 ' +
+        fmtSec(q.ttft_p90_ms) + '</span>';
+    }
+    if(det){
+      const qr = (q.queue_rate == null) ? '-' : (q.queue_rate * 100).toFixed(1) + '%';
+      const rec = q.recovery || {};
+      det.textContent = '排队 ' + qr + ' · 回读 ' + (rec.leak || 0) + '+' + (rec.dsml || 0) +
+        ' · 模式 ' + (q.queue_mode || '-');
+    }
+  }catch(e){ /* 面板静默：健康检查失败不该刷错误 */ }
+}
+
 async function loadAnalytics(){
   try {
     // 两个端点并行：矩阵有自己的 §range，失败也不影响 KPI（loadByKey 内部自吞异常）
     const [data] = await Promise.all([getJSON('/usage/analytics'), loadByKey()]);
     cachedAnalyticsData = data;
     renderAnalytics(data);
+    loadQuality();
   } catch(err) {
     console.error('loadAnalytics failed:', err);
   }

@@ -138,6 +138,14 @@ def main(argv):
     # 管不到它们，必须由 runner 直接注入环境变量。
     _acc_usage = os.path.join(ROOT, "_acc", "usage")
     env.setdefault("QD_PROXY_USAGE_DIR", _acc_usage)
+    # issue #87：测试里的本机 HTTP 不能被系统代理劫持。开发机常设
+    # HTTP(S)_PROXY（如 127.0.0.1:7897），一旦带上，套件对 127.0.0.1 的请求会
+    # 走代理并被回 502 —— 表现为「整批套件莫名全红」，而真实代码没问题。
+    # 这里在**子进程环境**里统一清掉（个别套件需要时会自己 set）。
+    for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+               "http_proxy", "https_proxy", "all_proxy",
+               "NO_PROXY", "no_proxy"):
+        env.pop(_k, None)
     # 跑前清一次：套件每次请求都会 append 一行，不清则越跑越大。
     # 只删隔离区，真实用量在 <ROOT>/usage，绝不被碰。
     # 不用 ignore_errors：Windows 上杀软/残留句柄导致的 PermissionError 会被
