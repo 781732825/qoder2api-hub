@@ -9,7 +9,7 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
-## v1.6.13
+## v1.6.14
 
 **🐛 问题修复（macOS / Linux 常驻场景，#89）**
 
@@ -30,6 +30,22 @@
 **📚 文档**：README 的平台表、`docs/deployment.md` 的脚本表与升级步骤都补上 macOS / Linux 的停止方式与常驻说明。
 
 **验证**：新增 `tests/_test_issue89_startup_stop.py`（20 条：实例分类四种情况、启动/绑定重试、提示文案、脚本语法与安全校验，POSIX 上还会真跑一次「启动→读 pid→停止→进程消失」）；全量 **69 suites / 1920 checks / 0 failed**。
+
+## v1.6.13
+
+**✨ 新增功能**
+
+- **排队可见 / 快速失败（`QD_QUEUE_WAIT_MODE`）**：`visible`（默认）流式请求先建流并持续发心跳 + `qoder_queue` 提示帧；`fast` 立即返回 503 + `Retry-After`；`wait` 保留旧行为。
+- **排队中文原因**：`上游模型排队中（10605 / RESOURCE_LIMIT）：请稍后重试，或换一个模型/区域。这不是你的 Key、账号或网络问题。`
+- **面板质量指标**：`/health.quality` + 分析页卡片——首字延迟 p50/p90、输出 tok/s、排队率、回读命中。
+
+**🐛 问题修复**
+
+- **Responses（Codex）路径接入回读链**：三条入口（chat / Anthropic / Responses）行为一致。
+- **`/v1/responses` 兼容补齐**：`stream_options` 透传、`parallel_tool_calls` 默认 True；未实现字段显式告警一次。
+- **测试隔离**：runner 统一剥离 `HTTP(S)_PROXY` / `NO_PROXY`（开发机代理会让本机套件被回 502），并修掉 #70 排程套件的时间依赖 flake。
+
+**验证**：68 suites / 1899 checks / 0 failed。
 
 ## v1.6.12
 
