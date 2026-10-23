@@ -30,12 +30,30 @@ is_qoder_proxy() {
     return 1
 }
 
+# A zombie (defunct) process still answers kill -0 but is effectively gone;
+# without this check the wait loop below would spin 10s and then report failure
+# just because the parent has not reaped it yet.
+pid_gone() {
+    _p="$1"
+    if ! kill -0 "$_p" 2>/dev/null; then
+        return 0
+    fi
+    _st="$(ps -p "$_p" -o state= 2>/dev/null | tr -d ' 	')"
+    if [ -z "$_st" ]; then
+        return 0
+    fi
+    case "$_st" in
+        Z*) return 0 ;;
+    esac
+    return 1
+}
+
 stop_pid() {
     _pid="$1"
     kill -TERM "$_pid" 2>/dev/null || true
     _i=0
     while [ "$_i" -lt 20 ]; do
-        if ! kill -0 "$_pid" 2>/dev/null; then
+        if pid_gone "$_pid"; then
             return 0
         fi
         sleep 0.5
@@ -44,7 +62,7 @@ stop_pid() {
     echo "[WARN] PID $_pid did not exit after 10s - sending SIGKILL"
     kill -KILL "$_pid" 2>/dev/null || true
     sleep 0.5
-    ! kill -0 "$_pid" 2>/dev/null
+    pid_gone "$_pid"
 }
 
 PID=""
