@@ -3168,6 +3168,50 @@ def apply_update_now(tag=None):
     with _UPDATE_LOCK:
         return qoder_updater.apply_update(APP_ROOT, tag=tag)
 
+# 进程级启动时间：/health 回给外部（issue #89：判断「跑的是不是新版本」）
+STARTED_AT = time.time()
+
+
+def _pid_alive(pid):
+    """PID 是否还活着（跨平台；权限不足视为活着）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def classify_existing_instance(existing, pid_alive=None):
+    """判断 /health 的应答者属于哪种情况（issue #89）。
+
+    返回 "foreign" / "healthy" / "stale" / "none"：
+      · foreign  —— 同端口上是别的服务（service 字段不对或没有 accounts）
+      · healthy  —— 真的是一个活着的 qd-proxy
+      · stale    —— 应答来自**正在退出**的旧实例（pid 已不存在），不该拦启动
+      · none     —— 没人应答
+    """
+    if not isinstance(existing, dict):
+        return "none"
+    if existing.get("service") not in (None, "qoder-proxy") \
+            or "accounts" not in existing:
+        return "foreign"
+    alive = pid_alive or _pid_alive
+    pid = existing.get("pid")
+    if pid and not alive(pid):
+        return "stale"
+    return "healthy"
+
+
 # ---------------------------------------------------------------------------
 # 项目新版本检测（对比 GitHub 最新 release；结果缓存 6 小时）
 # ---------------------------------------------------------------------------
@@ -8541,6 +8585,10 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "service": "qoder-proxy",
                 "version": VERSION,
+                "pid": os.getpid(),
+                "started_at": int(STARTED_AT),
+                "started_iso": time.strftime(
+                    "%Y-%m-%d %H:%M:%S", time.localtime(STARTED_AT)),
                 "realm": CURRENT_REALM,
                 "accounts": len(POOL.accounts) if POOL else 0,
                 "accounts_ready": POOL.count_ready() if POOL else 0,
@@ -10713,43 +10761,62 @@ def main():
 
     # 拒绝启动第二份：Windows 上 SO_REUSEADDR 会让两个 socket 绑同一端口，
     # 连接被静默分流，极难诊断。
-    try:
-        probe = urllib.request.urlopen(
-            "http://%s:%d/health"
-            % ("127.0.0.1" if args.host == "0.0.0.0" else args.host, args.port),
-            timeout=2)
-        existing = json.loads(probe.read().decode("utf-8"))
-    except Exception:
-        existing = None   # 没人应答 /health —— 让下面的 bind 决定
-    if isinstance(existing, dict):
-        # 只有我们的 /health 带账号池字段（"accounts"）。其它服务可能占用
-        # 同端口也应答 /health JSON（例如 wb-proxy / mimo-api-proxy）。
-        foreign = existing.get("service") not in (None, "qoder-proxy") \
-            or "accounts" not in existing
-        if foreign:
-            who = existing.get("service") or "an unknown HTTP service"
-            print()
-            print("  [ERROR] port %d is already taken by another program: %s"
-                  % (args.port, who))
-            print("          qd-proxy itself is NOT running - nothing was "
-                  "started.")
-            print()
-            print("  Fix: start qoder-proxy on a different port, e.g.")
-            print("          %s %d" % (START_SCRIPT, args.port + 1))
-            print("          python qoder_proxy.py --port %d" % (args.port + 1))
-            print()
-            for cmd in port_owner_hint(args.port):
-                print("  Check who owns the port:  %s" % cmd)
-            print()
-            raise SystemExit(1)
+    #
+    # issue #89：只问「有没有人应答 /health」会把「刚收到 SIGTERM、还在收尾的旧
+    # 实例」误判成健康双开——升级（kill 后立刻 start）时几乎必撞。现在按 应答者
+    # 的 pid 是否还活着 分类，并对「端口尚未释放」做有限重试。
+    def _probe_health(timeout=2.0):
+        try:
+            url = "http://%s:%d/health" % (
+                "127.0.0.1" if args.host == "0.0.0.0" else args.host,
+                args.port)
+            with urllib.request.urlopen(url, timeout=timeout) as probe:
+                return json.loads(probe.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    existing = None
+    for _attempt in range(3):
+        existing = _probe_health()
+        if classify_existing_instance(existing) != "stale":
+            break
+        print()
+        print("  [WARN] %d 端口仍有人在应答 /health，但它的进程已经退出"
+              % args.port)
+        print("         （旧实例正在释放端口）。继续启动新实例：等待 %d/3 ..."
+              % (_attempt + 1))
+        sys.stdout.flush()
+        time.sleep(1.2)
+        existing = None
+    _kind = classify_existing_instance(existing)
+    if _kind == "foreign":
+        who = (existing or {}).get("service") or "an unknown HTTP service"
+        print()
+        print("  [ERROR] port %d is already taken by another program: %s"
+              % (args.port, who))
+        print("          qd-proxy itself is NOT running - nothing was "
+              "started.")
+        print()
+        print("  Fix: start qoder-proxy on a different port, e.g.")
+        print("          %s %d" % (START_SCRIPT, args.port + 1))
+        print("          python qoder_proxy.py --port %d" % (args.port + 1))
+        print()
+        for cmd in port_owner_hint(args.port):
+            print("  Check who owns the port:  %s" % cmd)
+        print()
+        raise SystemExit(1)
+    if _kind == "healthy":
         print()
         print("  [已有一个反代在 %d 端口运行，无需重复启动]" % args.port)
+        print("  PID: %s · 版本: %s · 启动于: %s"
+              % (existing.get("pid") or "?", existing.get("version") or "?",
+                 existing.get("started_iso") or "?"))
         print("  账号: %s @ %s" % (existing.get("uid", "?"),
                                    existing.get("domain", "?")))
         print("  看板: http://127.0.0.1:%d/" % args.port)
         print()
-        print("  如果要重启: 先把原来那个窗口关掉（或结束 python 进程），"
-              "再运行本程序。")
+        print("  如果要重启: 用 stop 脚本（Windows: stop-qoder-proxy.bat /"
+              " Linux·macOS: ./stop-qoder-proxy.sh），再启动本程序。")
         print()
         return
 
@@ -10922,23 +10989,41 @@ def main():
         print()
         sys.stdout.flush()
 
-    try:
-        server = ThreadingHTTPServer((args.host, args.port), Handler)
-    except OSError as exc:
-        # bind 前探测与 bind 之间端口被抢，或被不答 /health 的程序占着
-        print()
-        print("  [ERROR] failed to listen on %s:%d - %s"
-              % (args.host, args.port, exc))
-        print("          the port is reserved or held by another program;")
-        print("          qd-proxy did NOT start.")
-        print()
-        print("  Fix: stop the program holding the port, or pick another "
-              "port:")
-        for cmd in port_owner_hint(args.port):
-            print("          %s" % cmd)
-        print("          %s %d" % (START_SCRIPT, args.port + 1))
-        print()
-        raise SystemExit(1)
+    # issue #89：旧实例刚退出时端口可能还没释放——有限重试，并在此期间复查
+    # /health：如果是**健康**实例起来了，就按「已在运行」退出而不是报错。
+    server = None
+    for _attempt in range(3):
+        try:
+            server = ThreadingHTTPServer((args.host, args.port), Handler)
+            break
+        except OSError as exc:
+            _kind2 = classify_existing_instance(_probe_health(1.0))
+            if _kind2 == "healthy":
+                print()
+                print("  [已有一个反代在 %d 端口运行，无需重复启动]" % args.port)
+                print("  看板: http://127.0.0.1:%d/" % args.port)
+                print()
+                return
+            if _attempt < 2:
+                print("  [WARN] bind %s:%d 失败（%s）——端口可能仍在释放，"
+                      "重试 %d/3 ..." % (args.host, args.port, exc, _attempt + 1))
+                sys.stdout.flush()
+                time.sleep(1.5)
+                continue
+            print()
+            print("  [ERROR] failed to listen on %s:%d - %s"
+                  % (args.host, args.port, exc))
+            print("          the port is reserved or held by another program")
+            print("          (possibly a qd-proxy instance that is still shutting down);")
+            print("          qd-proxy did NOT start.")
+            print()
+            print("  Fix: wait a second and retry, stop the program holding the")
+            print("       port, or pick another port:")
+            for cmd in port_owner_hint(args.port):
+                print("          %s" % cmd)
+            print("          %s %d" % (START_SCRIPT, args.port + 1))
+            print()
+            raise SystemExit(1)
     log("listening  : http://%s:%d/v1  (api key: %s)"
         % (args.host, args.port, "on" if API_KEY else "off"))
     log("dashboard  : http://%s:%d/" % (args.host, args.port))

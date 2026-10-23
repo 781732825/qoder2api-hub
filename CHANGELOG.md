@@ -9,6 +9,28 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.6.13
+
+**🐛 问题修复（macOS / Linux 常驻场景，#89）**
+
+- **防双开把「正在退出的旧进程」当成健康实例**：启动探测只问「有没有人应答 `/health`」，于是 `kill 旧进程 && 立刻 start` 这种最常见的升级姿势里，旧实例还在收尾、仍能应答，新实例就打印「已有一个反代在运行」并**主动退出**——服务一个都没起来，日志却在说「别重复启动」。
+  现在：`/health` 返回 `pid` / `started_at` / `started_iso`；启动时按**应答者的 pid 是否还活着**分类：
+  - `stale`（pid 已退出）→ 提示「旧实例正在释放端口」并等待重试（最多 3 轮），继续启动；
+  - `healthy` → 仍按双开处理，但提示里带上 **PID / 版本 / 启动时间**，并指向官方停止脚本；
+  - `foreign`（别的服务占端口）→ 保持原有的明确报错。
+  另外 `bind` 失败也加了 3 次重试（每次 1.5s），并在重试期间复查 `/health`——如果确实是健康实例起来了，按「已在运行」退出而不是报错。
+
+- **macOS / Linux 没有官方停止手段**：`start-qoder-proxy.sh` 从不传 `--pid-file`，`qoder-proxy.pid` 永远是陈旧值，常驻（nohup / launchd / tmux）时只能靠 `lsof` 猜 PID。
+  现在：`start-qoder-proxy.sh` 写 `--pid-file`，并新增 **`stop-qoder-proxy.sh`**（对齐 `.bat` 的严谨程度）：
+  - 读 `qoder-proxy.pid` → 校验命令行含 `qoder_proxy.py` → 只停那一个 PID；
+  - 先 `SIGTERM`，10 秒不退再 `SIGKILL`；
+  - pid 文件缺失时按「进程名 + `--port`」兜底，且**拒绝**停不是 qoder-proxy 的进程；
+  - 结束时清理 pid 文件，过期 pid 文件会被识别并移除。
+
+**📚 文档**：README 的平台表、`docs/deployment.md` 的脚本表与升级步骤都补上 macOS / Linux 的停止方式与常驻说明。
+
+**验证**：新增 `tests/_test_issue89_startup_stop.py`（20 条：实例分类四种情况、启动/绑定重试、提示文案、脚本语法与安全校验，POSIX 上还会真跑一次「启动→读 pid→停止→进程消失」）；全量 **69 suites / 1920 checks / 0 failed**。
+
 ## v1.6.12
 
 **🐛 问题修复**
