@@ -1518,6 +1518,38 @@ class Account(object):
             "note": self.note,
         }
 
+    def is_team(self):
+        """是否团队 / 企业账号（issue #90）。
+
+        判定与 proxy 侧 _is_team_account 同源，优先级：
+          1. userinfo 里带 organization_id / organization_name（OAuth 登录即有）；
+          2. userType 含 team / enterprise（PAT 导入等路径）；
+          3. 额度快照里有组织共享池（orgResourcePackage 等）。
+        三者任一命中即算——企业号即使 userType 是个人风格，只要挂了组织就算。
+        """
+        if str(self.organization_id or "").strip() or \
+                str(self.organization_name or "").strip():
+            return True
+        ut = str(self.user_type or "").lower()
+        if "team" in ut or "enterprise" in ut:
+            return True
+        cred = self.credits if isinstance(self.credits, dict) else {}
+        shared = cred.get("shared")
+        if isinstance(shared, dict) and (shared.get("size") or shared.get("unlimited")):
+            return True
+        for pkg in cred.get("packages") or []:
+            if isinstance(pkg, dict) and pkg.get("name") == "共享额度":
+                return True
+        return False
+
+    def org_label(self):
+        """企业/组织展示名（面板徽标用；没有组织返回空串）。"""
+        name = str(self.organization_name or "").strip()
+        if name:
+            return name
+        oid = str(self.organization_id or "").strip()
+        return ("org " + oid[:8]) if oid else ""
+
     def public(self):
         exp = self.expires_at
         return {
@@ -1571,6 +1603,8 @@ class Account(object):
             "lastCheckin": self.last_checkin,
             # 运行时探测：None=未探测（照常尝试）/ True / False（本区域无接口）
             "canCheckin": self.can_checkin(),
+            "isTeam": self.is_team(),
+            "orgLabel": self.org_label(),
             "checkedInToday": self._checkin_stamped_today(),
             "lastCheckinDate": str(self.last_checkin or "")[:10],
             "lastCreditsDelta": self.last_credits_delta,
@@ -3948,8 +3982,8 @@ class AccountPool(object):
             uid = str(ui.get("id") or uid)
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE
-            org_id = str(ui.get("organization_id") or "")
-            org_name = str(ui.get("organization_name") or "")
+            org_id = str(ui.get("organization_id") or ui.get("organizationId") or "")
+            org_name = str(ui.get("organization_name") or ui.get("organizationName") or "")
         except Exception:
             user_type, org_id, org_name = DEFAULT_USER_TYPE, "", ""
 
@@ -4004,8 +4038,8 @@ class AccountPool(object):
             uid = str(ui.get("id") or "")
             nickname = str(ui.get("name") or "")
             user_type = str(ui.get("user_type") or "") or DEFAULT_USER_TYPE
-            org_id = str(ui.get("organization_id") or "")
-            org_name = str(ui.get("organization_name") or "")
+            org_id = str(ui.get("organization_id") or ui.get("organizationId") or "")
+            org_name = str(ui.get("organization_name") or ui.get("organizationName") or "")
         except Exception:
             pass
         if data.get("expires_in"):

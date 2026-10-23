@@ -9,6 +9,19 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.0
+
+**✨ 企业 / 团队账号（#90）**
+
+企业账号一直能用（额度走组织共享池），但**判定口径是错的**：此前只看 `userType` 含 team/enterprise，或额度里有共享池；而 `/api/v1/userinfo` 根本不返回 `user_type`，于是企业号被当成个人号——团队闸门不生效、共享额度不计入有效余额。
+
+- **判定统一到 `Account.is_team()`，三层优先**：① 组织字段（`organization_id` / `organization_name`，OAuth 登录即有）→ ② `userType` → ③ 额度快照里的共享池（含 `cap=-1` 无限池）；proxy 侧的 `_is_team_account()` 改为委托它，两处口径不再分裂。
+- **面板徽标**：企业/团队账号在账号名旁显示紫色的 **企业 · 组织名**（`public()` 新增 `isTeam` / `orgLabel`），一眼分清个人号与组织席位。
+- **登录字段兼容**：`organization_id` / `organization_name` 同时接受 camelCase 形态，避免换了个上游版本就丢组织信息。
+- **文档**：`docs/accounts.md` 新增《怎么把企业账号接进来》与《「企业号抓不到」的常见原因》——含 SSO 强制场景改用「导入 PAT」、`cap=-1` 无限池的显示口径、以及组织字段为空的含义。
+
+**验证**：新增 `tests/_test_issue90_enterprise.py`（21 条：三层判定、orgLabel 回退、public 字段、面板徽标、camelCase 兼容、文档）；全量 **70 suites / 1941 checks / 0 failed**。
+
 ## v1.6.14
 
 **🐛 问题修复（macOS / Linux 常驻场景，#89）**

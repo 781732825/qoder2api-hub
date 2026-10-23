@@ -61,7 +61,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.6.14"
+VERSION = "1.7.0"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -6109,15 +6109,31 @@ def _team_min_gap():
 
 
 def _is_team_account(account):
-    """团队/企业账号判定：userType 或额度快照里有组织共享池（issue #56）。"""
+    """团队/企业账号判定（issue #56 / #90）。
+
+    口径与 Account.is_team() 同源：组织字段（OAuth 登录即带）> userType > 共享额度池。
+    issue #90 起因：userinfo 根本不返回 user_type，企业号只靠 userType 判定会漏，
+    结果团队闸门/共享额度都不生效。
+    """
     if account is None:
         return False
+    probe = getattr(account, "is_team", None)
+    if callable(probe):
+        try:
+            return bool(probe())
+        except Exception:
+            pass
     ut = str(getattr(account, "user_type", "") or "").lower()
     if "team" in ut or "enterprise" in ut:
         return True
+    if str(getattr(account, "organization_id", "") or "").strip() \
+            or str(getattr(account, "organization_name", "") or "").strip():
+        return True
     cred = getattr(account, "credits", None)
     if isinstance(cred, dict):
-        if isinstance(cred.get("shared"), dict) and cred["shared"].get("size"):
+        shared = cred.get("shared")
+        if isinstance(shared, dict) and (shared.get("size")
+                                        or shared.get("unlimited")):
             return True
         for pkg in cred.get("packages") or []:
             if isinstance(pkg, dict) and pkg.get("name") == "共享额度":

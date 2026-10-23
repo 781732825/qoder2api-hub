@@ -387,6 +387,13 @@ a:hover{text-decoration:underline}
 @keyframes insightSpin{to{transform:rotate(360deg)}}
 
 
+
+/* 企业 / 团队账号徽标（issue #90） */
+.team-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 8px;
+  border-radius:999px;white-space:nowrap;color:#a78bfa;background:rgba(167,139,250,.14);
+  border:1px solid rgba(167,139,250,.42);transition:background .18s ease,color .18s ease}
+.team-badge svg{width:11px;height:11px}
+.team-badge:hover{background:rgba(167,139,250,.24)}
 /* 账号行：今日签到徽标 + 积分变化 */
 .ck-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;padding:2px 8px;white-space:nowrap;
   border-radius:999px;border:1px solid var(--line);background:var(--panel2);color:var(--dim);
@@ -3023,6 +3030,15 @@ function accountGuardBadge(a){
 }
 
 
+
+// 企业 / 团队账号徽标（issue #90：service 端 isTeam / orgLabel）
+function teamBadge(a){
+  if(!a || !a.isTeam) return "";
+  const org = a.orgLabel ? (" · " + esc(a.orgLabel)) : "";
+  return '<span class="team-badge" title="团队/企业账号' + org + '（额度走组织共享池）">'
+    + '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18"/><path d="M5 21V7l7-4 7 4v14"/><path d="M9 21v-6h6v6"/></svg>'
+    + '企业' + (a.orgLabel ? (" · " + esc(a.orgLabel)) : "") + '</span>';
+}
 // 今日是否已签到（服务端 public() 的 checkedInToday / lastCheckinDate）
 function checkinBadge(a){
   if(a && a.checkedInToday){
@@ -3096,7 +3112,7 @@ function accountRow(a){
     + '<td style="text-align:center;white-space:nowrap">' + realmBadge + '</td>'
     + '<td style="text-align:left">'
     +   '<div style="font-weight:600;font-size:13px;color:var(--fg);display:flex;align-items:center;gap:6px;flex-wrap:wrap">'
-    +     esc(a.nickname) + checkinBadge(a) + '</div>'
+    +     esc(a.nickname) + teamBadge(a) + checkinBadge(a) + '</div>'
     + '<div class="mono" style="color:var(--dim);font-size:11px">' + esc(a.uid.slice(0,8)) + ' · ' + esc(a.source) + ' · 到期 ' + esc(a.expiresIn || '?') + '</div>'
     + (a.machineId ? ('<div class="mono" style="color:var(--dim);font-size:10px;margin-top:2px" title="由账号UID稳定派生的专属设备码，防多号关联风控">设备码: ' + esc(a.machineId.slice(0,14)) + '...</div>') : '')
     + (a.note ? ('<div class="hint" style="margin:3px 0 0" title="备注（issue #69）"><span style="color:var(--accent)">备注</span> ' + esc(a.note) + '</div>') : '')
