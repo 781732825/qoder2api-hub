@@ -115,8 +115,26 @@ check("pageNavSections 会跳过 .hint-icon（侧栏标签不带 ?）",
 check("boot 对每步容错（否则页签初始化会被跳过）",
       "boot step failed:" in _dash)
 
-print("[stats] 顶栏吸顶只作用于 body>header")
+print("[stats] getElementById 字面量 id 必须真实存在")
 import re as _re
+# 回归护栏：v1.7.1 删掉性能矩阵容器后，refreshInner() 里仍留着
+# document.getElementById('perfMatrix').innerHTML = ... ，每 5 秒抛一次
+# TypeError。导入账号后接着调用的 refresh() 也抛，于是用户看到
+# 「导入失败: Cannot set properties of null」——其实账号已经导入成功了。
+_id_defs = set(_re.findall(r'id="([\w\-]+)"', _dash))
+_id_defs |= set(_re.findall(r"\.id\s*=\s*['\"]([\w\-]+)['\"]", _dash))
+_id_defs |= set(_re.findall(r"id:\s*['\"]([\w\-]+)['\"]", _dash))
+_refs = set(_re.findall(r"getElementById\(\s*['\"]([\w\-]+)['\"]\s*\)", _dash))
+# 只有「取到就直接赋属性」才会抛；写成 if(x) 判断或 || 兜底的允许悬空
+_unguarded = set(_re.findall(
+    r"getElementById\(\s*['\"]([\w\-]+)['\"]\s*\)\s*\.\s*"
+    r"(?:innerHTML|textContent|className|style|value|checked|disabled|classList)",
+    _dash))
+_dangling = sorted(_unguarded - _id_defs)
+check("没有「指向不存在 id 又直接赋属性」的 getElementById（引用 %d 个 id）" % len(_refs),
+      not _dangling, "悬空: " + ", ".join(_dangling))
+
+print("[stats] 顶栏吸顶只作用于 body>header")
 check("顶栏规则已收窄为 body>header（面板内的 <header> 不再吸顶）",
       "body>header{" in _dash and _re.search(r'(^|\n)header\{', _dash) is None)
 check("面板标题显式清掉吸顶/层级",
