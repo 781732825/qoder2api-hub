@@ -105,7 +105,9 @@ check("有悬浮提示与 reduced-motion 支持",
 check("区间切换有滑动指示器",
       "statSegPill" in _dash and "seg-pill" in _dash)
 check("数字滚动只在首屏/换区间（轮询不重播）",
-      "let statAnimate = true;" in _dash and "statAnimate = false;" in _dash)
+      "let statAnimateOnce = true;" in _dash
+      and "statAnimateOnce = !!force || !statData;" in _dash
+      and "statAnimateOnce = false;" in _dash)
 check("统计接口已挂路由", "/usage/stats" in io.open(
       os.path.join(ROOT, "qoder_proxy.py"), encoding="utf-8").read())
 
