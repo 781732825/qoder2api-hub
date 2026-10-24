@@ -461,10 +461,10 @@ a:hover{text-decoration:underline}
 .stat-panel>header h2{margin:0;font-size:13px;color:var(--fg);font-weight:600;line-height:1.3;
   text-transform:none;letter-spacing:normal}
 .stat-panel-sub{font-size:11px;color:var(--dim);margin-left:auto}
-.hint{display:inline-grid;place-items:center;width:14px;height:14px;border-radius:50%;
+.hint-icon{display:inline-grid;place-items:center;width:14px;height:14px;border-radius:50%;
   font-size:9px;color:var(--dim);border:1px solid var(--line);cursor:help;
   transition:color .18s ease,border-color .18s ease}
-.hint:hover{color:var(--accent);border-color:rgba(56,189,248,.5)}
+.hint-icon:hover{color:var(--accent);border-color:rgba(56,189,248,.5)}
 
 .rank-list{display:flex;flex-direction:column;gap:8px;min-height:56px}
 .rank-row{display:grid;grid-template-columns:1fr auto;gap:4px 10px;align-items:center;
@@ -1356,29 +1356,29 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 
   <div class="stat-grid2">
     <section class="stat-panel">
-      <header><h2>Top 账号 <span class="hint" title="按 Token 用量排序，取前 5 名">?</span></h2>
+      <header><h2>Top 账号 <span class="hint-icon" title="按 Token 用量排序，取前 5 名">?</span></h2>
         <span class="stat-panel-sub" id="topAcctSum"></span></header>
       <div class="rank-list" id="topAccounts"></div>
     </section>
     <section class="stat-panel">
-      <header><h2>Top 提供商 <span class="hint" title="按模型归属的上游厂商汇总">?</span></h2>
+      <header><h2>Top 提供商 <span class="hint-icon" title="按模型归属的上游厂商汇总">?</span></h2>
         <span class="stat-panel-sub" id="topProvSum"></span></header>
       <div class="rank-list" id="topProviders"></div>
     </section>
     <section class="stat-panel">
-      <header><h2>模型用量 <span class="hint" title="所选区间内各模型的 Token 占比">?</span></h2>
+      <header><h2>模型用量 <span class="hint-icon" title="所选区间内各模型的 Token 占比">?</span></h2>
         <span class="stat-panel-sub" id="modelSum"></span></header>
       <div class="rank-list" id="modelUsage"></div>
     </section>
     <section class="stat-panel">
-      <header><h2>提供商用量 <span class="hint" title="按厂商汇总（厂商由模型名推断）">?</span></h2>
+      <header><h2>提供商用量 <span class="hint-icon" title="按厂商汇总（厂商由模型名推断）">?</span></h2>
         <span class="stat-panel-sub" id="provSum"></span></header>
       <div class="rank-list" id="providerUsage"></div>
     </section>
   </div>
 
     <section class="stat-panel" style="grid-column:1/-1">
-      <header><h2>按 Key 档位分布 <span class="hint" title="口径：最近请求样本（每 5 秒刷新），不是全量聚合">?</span></h2>
+      <header><h2>按 Key 档位分布 <span class="hint-icon" title="口径：最近请求样本（每 5 秒刷新），不是全量聚合">?</span></h2>
         <span class="stat-panel-sub" id="effortSub"></span></header>
       <div id="effortByKey"></div>
     </section>
@@ -1390,7 +1390,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
   </section>
 
   <section class="stat-panel">
-    <header><h2>缓存命中率 <span class="hint" title="命中 = 上游报告的缓存命中 input token；输入 = 全部 input token">?</span></h2>
+    <header><h2>缓存命中率 <span class="hint-icon" title="命中 = 上游报告的缓存命中 input token；输入 = 全部 input token">?</span></h2>
       <span class="stat-panel-sub">只统计成功请求</span></header>
     <div class="cache-cards" id="cacheCards"></div>
   </section>
@@ -5021,8 +5021,8 @@ function pageNavLabel(section, index){
   if(h2){
     const clone = h2.cloneNode(true);
     // 去掉副标题与「?」提示标记（提示文字不该进侧栏锚点）
-    clone.querySelectorAll('em, .hint').forEach(el => el.remove());
-    const text = (clone.textContent || '').replace(/s+/g, ' ').trim();
+    clone.querySelectorAll('em, .hint-icon').forEach(el => el.remove());
+    const text = (clone.textContent || '').replace(/\s+/g, ' ').trim();
     if(text) return text;
   }
   return '未命名区块 ' + (index + 1);
