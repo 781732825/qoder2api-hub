@@ -62,7 +62,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.3"
+VERSION = "1.7.4"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -10051,6 +10051,40 @@ class Handler(BaseHTTPRequestHandler):
                          account=account.uid if account else None,
                          key_id=self._key_id_for_usage())
             return self._rate_limited(exc)
+        except UpstreamQueued as exc:
+            # issue #99：这个入口以前没接 #87 的排队分支，10605 排队会零等待
+            # 直接 503 且丢掉 Retry-After。此刻**还没写过任何字节**
+            # （_sse_begin 尚未调用），所以流内等待不存在「重复 message_start」
+            # 的顾虑——docstring 里那条能力差异只适用于 aggregate_stream 之后。
+            _msg, _et = friendly_upstream_error(503, exc.detail)
+            if not want_stream or queue_mode() != "visible":
+                return self._error(503, _msg, _et, retry_after=exc.retry_after)
+            self._sse_begin()
+            _q0 = time.time()
+
+            def _emit_q(kind, info):
+                info = dict(info or {})
+                info["model"] = model
+                if kind == "queue":
+                    self._queue_notice("anthropic", info)
+                else:
+                    self._queue_error_frame(
+                        "anthropic", info.get("message") or _msg,
+                        info.get("waited_seconds") or int(time.time() - _q0),
+                        info.get("budget_seconds") or QUEUE_WAIT_BUDGET_SECS)
+
+            _got = visible_queue_acquire(
+                exc,
+                lambda: open_upstream(chat_req, session_key=session_key,
+                                      target_realm=req_realm,
+                                      usage_ctx=usage_ctx),
+                _emit_q, started=_q0)
+            if _got is None:
+                self._sse_end()
+                return
+            upstream, account, _ = _got
+            self.realm_used = usage_ctx.get("realm") or req_realm
+            self.realm_reason = usage_ctx.get("realm_reason") or ""
         except UpstreamStatus as exc:
             # issue #59：PayloadTooLarge(413) 等本地拦下的错误——明确状态码，
             # 不进账号冷却/重试链路（上游根本没收到这个请求）。
@@ -10061,7 +10095,9 @@ class Handler(BaseHTTPRequestHandler):
                          account=account.uid if account else None,
                          key_id=self._key_id_for_usage())
             _msg, _etype = friendly_upstream_error(_code, exc.detail)
-            return self._error(_code, _msg, _etype)
+            # issue #99：即使走到兜底分支，也把上游建议的重试间隔透传出去
+            return self._error(_code, _msg, _etype,
+                               retry_after=getattr(exc, "retry_after", None))
         except urllib.error.HTTPError as exc:
             detail = getattr(exc, "qoder_detail", "")
             if not detail:

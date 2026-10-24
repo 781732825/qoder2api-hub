@@ -9,6 +9,21 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.4
+
+**🐛 问题修复**
+
+- **Anthropic 入口（`/v1/messages`）漏接排队分支**（#99）：`open_upstream()` 在 `visible` 模式下把 10605 排队抛给上层由各入口等待，但 `_handle_anthropic` 的 except 链里只有父类 `UpstreamStatus`，没有 `UpstreamQueued`——于是排队异常掉进兜底分支：**零等待**直接 503，并且**丢掉 `Retry-After`**。聚合网关（NewAPI 的 Claude 渠道）因此无法按上游建议退避，只能立刻重试。
+
+  现在与 `/v1/chat/completions`、`/v1/responses` 对齐：
+  - `visible` + 流式：建流后**流内等待**，用 anthropic 的 `ping` 事件携带 `qoder_queue` 报进度，超预算给 `event: error`（`overloaded_error`）收尾；
+  - `fast` 或非流式：直接 503 + `Retry-After` + 中文原因；
+  - 兜底的 `except UpstreamStatus` 也会透传 `retry_after`，避免将来出现新的排队形态时再次丢掉退避信息。
+
+  为什么这里可以安全地做流内等待：排队发生在 `open_upstream()` 阶段，此时**一个字节都还没写给客户端**（`_sse_begin()` 尚未调用），不存在 docstring 里担心的「重复 `message_start`」问题——那条能力差异只适用于 `aggregate_stream` 之后的分支。
+
+**验证**：新增 `tests/_test_issue99_anthropic_queue.py`（18 条：源码守卫 + 用桩 Handler 实测三条路径——非流式 503+Retry-After、`fast` 模式不建流、`visible` 流式发 ping 排队帧并在超预算时发 `event: error` 且不返回 `_error`）；全量 **75 suites / 2084 checks / 0 failed**。
+
 ## v1.7.3
 
 **🐛 问题修复**
