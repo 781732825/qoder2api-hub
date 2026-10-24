@@ -53,6 +53,7 @@ import qoder_anthropic
 import qoder_catalog
 import qoder_pricing
 import qoder_settings
+import qoder_session_cache
 import qoder_sign
 import qoder_updater
 import qoder_webtools
@@ -523,7 +524,8 @@ def row_matches_realm(row, realm):
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
                  gen_ms=None, fp=None, account=None, effort=None,
-                 effort_requested=None, key_id=None, realm_reason=None):
+                 effort_requested=None, key_id=None, realm_reason=None,
+                 session_trace=None):
     """Accumulate stats, append a JSONL row, and persist the summary.
 
     P1-3（推理档位审计 + key 归属）：后三个参数都是**可选**的，旧调用路径不传
@@ -548,6 +550,11 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None,
     row.update(fields)
     if fp:
         row.update(fp)
+    if session_trace:
+        # Never serialize tenant identifiers, client conversation IDs or prompts.
+        for field in ("session_affinity", "upstream_session_id"):
+            if session_trace.get(field):
+                row[field] = session_trace[field]
     if account:
         row["account"] = account
     # P1-3：推理档位审计（请求档位 vs 实际下发档位）与 API key 归属。
@@ -2354,6 +2361,72 @@ try:
     AFFINITY_MAX_MSGS = int(os.environ.get("QD_AFFINITY_MAX_MSGS", "0") or 0)
 except (TypeError, ValueError):
     AFFINITY_MAX_MSGS = 0
+
+
+_PREFIX_SESSION_CACHE = None
+_PREFIX_SESSION_CACHE_CONFIG = None
+_PREFIX_SESSION_CACHE_LOCK = threading.Lock()
+
+
+def prefix_session_cache():
+    """Select an opt-in memory/Redis session map; no backend means disabled."""
+    global _PREFIX_SESSION_CACHE, _PREFIX_SESSION_CACHE_CONFIG
+    url = (os.environ.get("QD_SESSION_REDIS_URL") or "").strip()
+    mode = (os.environ.get("QD_SESSION_CACHE") or
+            ("redis" if url else "off")).strip().lower()
+    if mode == "off":
+        return None
+    if mode not in ("memory", "redis"):
+        raise ValueError("QD_SESSION_CACHE must be off, memory or redis")
+    ttl = (os.environ.get("QD_SESSION_CACHE_TTL")
+           or os.environ.get("QD_SESSION_REDIS_TTL") or 3600)
+    timeout = os.environ.get("QD_SESSION_REDIS_TIMEOUT") or 0.4
+    max_entries = os.environ.get("QD_SESSION_CACHE_MAX_ENTRIES") or 4096
+    config = (mode, url, ttl, timeout, max_entries)
+    if _PREFIX_SESSION_CACHE is not None and config == _PREFIX_SESSION_CACHE_CONFIG:
+        return _PREFIX_SESSION_CACHE
+    with _PREFIX_SESSION_CACHE_LOCK:
+        if _PREFIX_SESSION_CACHE is None or config != _PREFIX_SESSION_CACHE_CONFIG:
+            secret = qoder_settings.panel_session_secret(ACCOUNTS_DIR)
+            if mode == "memory":
+                cache = qoder_session_cache.MemorySessionCache(
+                    ttl=ttl, max_entries=max_entries, hash_secret=secret)
+            else:
+                cache = qoder_session_cache.PrefixSessionCache(
+                    url, ttl=ttl, timeout=timeout, hash_secret=secret)
+            _PREFIX_SESSION_CACHE = cache
+            _PREFIX_SESSION_CACHE_CONFIG = config
+    return _PREFIX_SESSION_CACHE
+
+
+def assign_prefix_session(body, account, model_key, client_session_key=None,
+                          usage_ctx=None):
+    """Choose a cache-affine ID only within the selected upstream account."""
+    # Always reset: a preceding failed account may already have acquired an ID.
+    body["session_id"] = str(uuid.uuid4())
+    if usage_ctx is not None:
+        usage_ctx["session_affinity"] = "random"
+    try:
+        cache = prefix_session_cache()
+        if cache is not None:
+            matched = cache.resolve(
+                body.get("messages"), account.uid, account.realm, model_key,
+                client_session_key=client_session_key,
+                tenant_scope=(usage_ctx or {}).get("tenant_scope", ""),
+                context={"tools": body.get("tools"),
+                         "parameters": body.get("parameters"),
+                         "agent_id": body.get("agent_id")})
+            if matched:
+                body["session_id"] = matched
+                if usage_ctx is not None:
+                    usage_ctx["session_affinity"] = cache.backend + "-prefix"
+    except Exception as exc:
+        # Optional optimization: cache failure must not break inference or
+        # log a connection URL, password, message, or raw exception details.
+        log("prefix session cache unavailable (%s); random session used"
+            % type(exc).__name__, level="WARN", tag="chat")
+    if usage_ctx is not None:
+        usage_ctx["upstream_session_id"] = body["session_id"]
 
 
 def derive_affinity_key(messages):
@@ -6199,7 +6272,7 @@ def should_retry_envelope(exc, emitted_bytes, attempt):
 
 
 def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
-                                  holder, account):
+                                  holder, account, usage_ctx=None):
     """非流式：流内瞬时错误信封 / 传输抖动 -> 重开上游重新聚合。
 
     仅用于客户端尚未收到任何字节的非流式路径。返回 (chat_obj, account)：
@@ -6209,6 +6282,7 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
       - 传输层瞬时错误（TLS EOF 等）同样触发重开
     传入的 resp 由调用方的 with/finally 关闭；本函数只负责关闭重开的新连接。
     """
+    reopen_options = {"usage_ctx": usage_ctx} if usage_ctx is not None else {}
     cur = resp
     try:
         # issue #51 补充：排队可能要多等几轮（仅排队时 should_retry 才允许）
@@ -6229,7 +6303,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 time.sleep(_envelope_retry_wait(exc, attempt + 1))
                 try:
                     new_resp, account, _ = open_upstream(
-                        payload, session_key=session_key, target_realm=realm)
+                        payload, session_key=session_key, target_realm=realm,
+                        **reopen_options)
                 except Exception as reopen_exc:
                     log("reopen after envelope error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -6252,7 +6327,8 @@ def aggregate_with_envelope_retry(resp, payload, session_key, realm, model,
                 time.sleep(attempt + 1)
                 try:
                     new_resp, account, _ = open_upstream(
-                        payload, session_key=session_key, target_realm=realm)
+                        payload, session_key=session_key, target_realm=realm,
+                        **reopen_options)
                 except Exception as reopen_exc:
                     log("reopen after transport error failed: %s"
                         % str(reopen_exc)[:160], level="WARN", tag="chat")
@@ -6630,6 +6706,7 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
             level="WARN", tag="chat")
         raise PayloadTooLarge(_size, MAX_UPSTREAM_BODY_BYTES)
 
+    client_session_key = session_key
     if not session_key:
         session_key = derive_affinity_key(body_obj.get("messages"))
         if session_key and AFFINITY_DEBUG:
@@ -6683,6 +6760,10 @@ def open_upstream(payload, session_key=None, target_realm=None, usage_ctx=None,
         # 身份相关的 aliyun_user_type 需要真实账号
         body_obj["aliyun_user_type"] = account.user_type or \
             qoder_sign.DEFAULT_USER_TYPE
+        # Resolve only after choosing the actual account, before signing.
+        assign_prefix_session(body_obj, account, model_key,
+                              client_session_key=client_session_key,
+                              usage_ctx=usage_ctx)
         encoded = qoder_encode(
             json.dumps(body_obj, ensure_ascii=False).encode("utf-8"))
         # 官方候选推理主机（国际版 api1/api2/api3）：传输层失败时切换域名，
@@ -9953,7 +10034,7 @@ class Handler(BaseHTTPRequestHandler):
         # 而选号成功前它就是 None。必须在任何可能抛异常的语句之前。
         account = None
         try:
-            usage_ctx = {}
+            usage_ctx = {"tenant_scope": self._key_id_for_usage()}
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -10037,7 +10118,8 @@ class Handler(BaseHTTPRequestHandler):
                                  effort=usage_ctx.get("effort"),
                                  effort_requested=usage_ctx.get("effort_requested"),
                                  key_id=self._key_id_for_usage(),
-                                 realm_reason=usage_ctx.get("realm_reason", ""))
+                                 realm_reason=usage_ctx.get("realm_reason", ""),
+                                 session_trace=usage_ctx)
                     return
                 except UpstreamStatus as exc:
                     # Anthropic 侧不重开（见 docstring）：直接给终态 error 事件。
@@ -10065,12 +10147,13 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             session_trace=usage_ctx)
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, usage_ctx=usage_ctx)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -10095,7 +10178,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         session_trace=usage_ctx)
             return self._json(200, result)
 
     def _handle_web_tools(self, path, payload, names):
@@ -10116,16 +10200,18 @@ class Handler(BaseHTTPRequestHandler):
         chat_req["tools"] = rewrite_web_tools(chat_req.get("tools") or [], names)
         chat_req["stream"] = False
         model = str(chat_req.get("model") or "")
+        session_key = extract_session_key(self.headers, payload)
         messages = list(chat_req.get("messages") or [])
         realm = self._request_realm()
-        usage_ctx = {}
+        usage_ctx = {"tenant_scope": self._key_id_for_usage()}
         obj = None
         rounds = 0
         for _ in range(max(1, WEB_TOOLS_MAX_ROUNDS)):
             req = dict(chat_req, messages=messages)
             try:
                 resp, account, _ = open_upstream(
-                    req, target_realm=realm, usage_ctx=usage_ctx)
+                    req, target_realm=realm, usage_ctx=usage_ctx,
+                    session_key=session_key)
             except RateLimited as exc:
                 return self._rate_limited(exc)
             except urllib.error.HTTPError as exc:
@@ -10201,7 +10287,7 @@ class Handler(BaseHTTPRequestHandler):
         account = None
         try:
             req_realm = self._request_realm()
-            usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
+            usage_ctx = {"tenant_scope": self._key_id_for_usage()}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(chat_req.get("model"), req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -10337,7 +10423,8 @@ class Handler(BaseHTTPRequestHandler):
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
                                          key_id=self._key_id_for_usage(),
-                                         realm_reason=usage_ctx.get("realm_reason", ""))
+                                         realm_reason=usage_ctx.get("realm_reason", ""),
+                                         session_trace=usage_ctx)
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -10436,12 +10523,13 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             session_trace=usage_ctx)
                 return
             try:
                 chat_obj, account = aggregate_with_envelope_retry(
                     upstream, chat_req, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, usage_ctx=usage_ctx)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -10466,7 +10554,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         session_trace=usage_ctx)
             return self._json(200, result)
 
     def do_POST(self):
@@ -10666,7 +10755,7 @@ class Handler(BaseHTTPRequestHandler):
         account = None
         try:
             req_realm = self._request_realm()
-            usage_ctx = {}          # P1-3：推理档位审计出参（下传给 open_upstream）
+            usage_ctx = {"tenant_scope": self._key_id_for_usage()}          # P1-3：推理档位审计出参（下传给 open_upstream）
             blocked = self._model_precheck(model, req_realm)
             if blocked:
                 return self._error(400, blocked, "invalid_request_error")
@@ -10792,7 +10881,8 @@ class Handler(BaseHTTPRequestHandler):
                                          effort=usage_ctx.get("effort"),
                                          effort_requested=usage_ctx.get("effort_requested"),
                                          key_id=self._key_id_for_usage(),
-                                         realm_reason=usage_ctx.get("realm_reason", ""))
+                                         realm_reason=usage_ctx.get("realm_reason", ""),
+                                         session_trace=usage_ctx)
                             return
                         except UpstreamStatus as exc:
                             _handle_envelope_account_cooldown(account, exc, model=model, session_key=session_key)
@@ -10891,12 +10981,13 @@ class Handler(BaseHTTPRequestHandler):
                              effort=usage_ctx.get("effort"),
                              effort_requested=usage_ctx.get("effort_requested"),
                              key_id=self._key_id_for_usage(),
-                             realm_reason=usage_ctx.get("realm_reason", ""))
+                             realm_reason=usage_ctx.get("realm_reason", ""),
+                             session_trace=usage_ctx)
                 return
             try:
                 result, account = aggregate_with_envelope_retry(
                     upstream, payload, session_key, req_realm, model,
-                    holder, account)
+                    holder, account, usage_ctx=usage_ctx)
             except UpstreamStatus as exc:
                 record_error(model, exc.status, exc.detail,
                              elapsed_ms=int((time.time() - t_start) * 1000),
@@ -10930,7 +11021,8 @@ class Handler(BaseHTTPRequestHandler):
                          effort=usage_ctx.get("effort"),
                          effort_requested=usage_ctx.get("effort_requested"),
                          key_id=self._key_id_for_usage(),
-                         realm_reason=usage_ctx.get("realm_reason", ""))
+                         realm_reason=usage_ctx.get("realm_reason", ""),
+                         session_trace=usage_ctx)
             return self._json(200, result)
 
 
