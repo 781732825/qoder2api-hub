@@ -16,15 +16,22 @@ print("[stats] 后端聚合")
 _tmp = tempfile.mkdtemp(prefix="stats-")
 _log = os.path.join(_tmp, "usage.jsonl")
 _now = time.time()
+# 时间无关夹具（#70 同款教训）：把「今天的行」钉在本地零点之后，
+# 而不是 now-5h —— 否则在本地零点附近跑，部分行会掉进昨天，
+# 热力图峰值/活跃天数随跑测时刻漂移（CI 03:31 UTC 就红过）。
+_lt = time.localtime(_now)
+_midnight = time.mktime((_lt.tm_year, _lt.tm_mon, _lt.tm_mday, 0, 0, 0, 0, 0, -1))
+_today_at = lambda i: _midnight + 60 * (i + 1)      # 今天 00:01, 00:02 ...
+_yday_at = lambda i: _midnight - 3600 - 60 * i      # 昨天 23:00 起
 _rows = []
 # 3 天、3 个模型（两家厂商）、含 1 条错误行
 for i in range(5):
-    _rows.append({"at": _now - i * 3600, "iso": "", "model": "claude-4-sonnet",
+    _rows.append({"at": _today_at(i), "iso": "", "model": "claude-4-sonnet",
                   "prompt_tokens": 1000, "completion_tokens": 100,
                   "total_tokens": 1100, "cached_tokens": 600,
                   "account": "acct-1", "realm": "cn"})
 for i in range(3):
-    _rows.append({"at": _now - 86400 - i * 60, "iso": "", "model": "gpt-5",
+    _rows.append({"at": _yday_at(i), "iso": "", "model": "gpt-5",
                   "prompt_tokens": 500, "completion_tokens": 50,
                   "total_tokens": 550, "cached_tokens": 0,
                   "account": "acct-2", "realm": "cn"})
