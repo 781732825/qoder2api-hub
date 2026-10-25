@@ -9,6 +9,33 @@
   1.6.14 → **1.7.0**（不是 1.6.15，也不是 1.7.14）。
 - 主版本号只在确有破坏性变更时才动。
 
+## v1.7.5
+
+**🔄 跟进官方桌面端新版（CN 0.4.3 / intl 0.4.8）**
+
+逆向了两版客户端的 bundle，把「我们已经落后」和「可以顺手增强」的部分分开处理。
+
+**✨ 新增：官方积分消耗（真实记账口径）**
+
+- 客户端新增 `/sash/api/v1/ai-conversations/credits-summary`（累计消耗 + 单日峰值 + 峰值日）与 `credits-heatmap`（近 365 天逐日消耗），cn / intl 实测均 200；
+- 网关新增 `Account.fetch_credit_usage()`（按账号缓存 5 分钟）与 `GET /accounts/credits/usage`（汇总 + 逐日合并，支持 `?uid=` / `?realm=`）；
+- 面板「用量洞察」新增 **官方积分消耗** 区块：累计 / 峰值摘要 + 365 天热力图 + 按账号明细表（含查询失败标记）；前端另有 60 秒节流与签名去重，不跟着 5 秒轮询打。
+
+**🩹 增强：国际版活动平台第二入口**
+
+- `center.qoder.sh` 实测对 intl 的 `/sash/...` 返回 200、对 cn 返回 401，已作为 intl 的候选基址排在官网域名之前（`openapi_candidates` 仍只在连接失败/404 时才换）。
+
+**📌 已封成能力、暂未上界面**
+
+- `/sash/api/v1/me/achievements`（已获成就 key）→ `Account.fetch_achievements()`，用于解释「活动需先完成某成就」，面板展示留到下一版。
+
+**🔍 查过但不采用的**
+
+- `/api/v2/service/region/endpoints`、`/api/v2/me/usage`：用桌面端 token 在 openapi 上是 404（`api.qoder.com` 上是 401，属另一套鉴权），暂无可解析契约——intl 推理主机仍用硬编码 api3/api2/api1 + `QD_INTL_GATEWAY` 覆盖；
+- 客户端版本号：本机 CN 实际是 **0.4.3**（随包带了 `resources/umid/runtime-info.exe`），我们的 `DESKTOP_CLIENT_VERSION=0.4.8` 来自 intl，仍可用 `QD_DESKTOP_VERSION` 覆盖。
+
+**🧪 测试**：新增 `_test_credit_usage.py`（21 条：端点常量 / 解析 / 缓存命中 / 失败回退 / 路由 / 面板 / 节流 / 去重）；修掉 `_test_qoder.py` 里两处依赖「本机没有 runtime-info 组件」的断言（新版客户端已随包提供，改为显式钉 derived 身份再验证）。全量 **76 suites / 2105 checks / 0 failed**。
+
 ## v1.7.4
 
 **🐛 问题修复**

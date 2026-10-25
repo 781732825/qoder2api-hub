@@ -62,7 +62,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -9014,6 +9014,56 @@ class Handler(BaseHTTPRequestHandler):
                 "unpriced": _unpriced,
                 "note": "参考 OpenRouter 公布价折算，仅用于估算，不能用于结算；"
                         "可在 usage/pricing-overrides.json 覆盖单价",
+            })
+        if path == "/accounts/credits/usage":
+            # 官方积分消耗（0.4.3 客户端新增接口）：summary + 近 365 天逐日消耗
+            # ?uid= 只看单个账号；不传则汇总全部账号（realm 可选过滤）
+            if not self._authorized():
+                return
+            want_uid = (query.get("uid") or [None])[0]
+            want_realm = (query.get("realm") or [None])[0]
+            rows = []
+            daily_sum = {}
+            total = peak = 0.0
+            peak_date = ""
+            for acc in (POOL.accounts if POOL else []):
+                if want_uid and acc.uid != want_uid:
+                    continue
+                if want_realm and getattr(acc, "realm", "") != want_realm:
+                    continue
+                try:
+                    cu = acc.fetch_credit_usage()
+                except Exception as exc:
+                    cu = {"ok": False, "error": str(exc)[:120]}
+                rows.append({
+                    "uid": acc.uid,
+                    "nickname": acc.nickname or acc.uid[:8],
+                    "realm": getattr(acc, "realm", ""),
+                    "ok": bool(cu.get("ok")),
+                    "total": cu.get("total") or 0,
+                    "peak": cu.get("peak") or 0,
+                    "peak_date": cu.get("peak_date") or "",
+                    "error": cu.get("error") or "",
+                })
+                if not cu.get("ok"):
+                    continue
+                total += float(cu.get("total") or 0)
+                if float(cu.get("peak") or 0) >= peak:
+                    peak = float(cu.get("peak") or 0)
+                    peak_date = cu.get("peak_date") or peak_date
+                for item in (cu.get("daily") or []):
+                    d = item.get("date") or ""
+                    if d:
+                        daily_sum[d] = daily_sum.get(d, 0.0) + float(item.get("value") or 0)
+            daily = [{"date": k, "value": round(v, 4)}
+                     for k, v in sorted(daily_sum.items())]
+            return self._json(200, {
+                "accounts": rows,
+                "total": round(total, 4),
+                "peak": round(peak, 4),
+                "peak_date": peak_date,
+                "daily": daily,
+                "unit": "credits",
             })
         if path == "/accounts/credits/grants":
             # 积分获取历史（跟进 wb）：只读内存里的积分快照，不发上游请求

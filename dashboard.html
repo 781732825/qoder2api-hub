@@ -1429,6 +1429,11 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
     <div class="insight-grid" id="insightCards"></div>
 
     <div class="insight-block">
+      <h2>官方积分消耗 <em id="creditUsageHint"></em></h2>
+      <div id="creditUsageWrap"></div>
+    </div>
+
+    <div class="insight-block">
       <h2>积分包与获取记录 <em id="grantsHint"></em></h2>
       <div class="table-wrap" id="grantsWrap"></div>
     </div>
@@ -2794,7 +2799,76 @@ async function saveSchedule(btn){
 let INSIGHT_GRANTS = [];
 let INSIGHT_REMAIN = [];
 let INSIGHT_ACTIVITY = [];
-let INSIGHT_SIG = "";        // 上次渲染的数据签名（issue #98：不变就不重绘）
+let INSIGHT_SIG = "";
+// 官方积分消耗（0.4.3 客户端新增接口 /accounts/credits/usage）：累计 + 峰值日 + 365 天热力图
+let CREDIT_USAGE_SIG = "";
+let CREDIT_USAGE_AT = 0;
+async function loadCreditUsage(force){
+  if(!force && Date.now() - CREDIT_USAGE_AT < 60000) return;
+  CREDIT_USAGE_AT = Date.now();
+  const box = document.getElementById("creditUsageWrap");
+  if(!box) return;
+  let d = null;
+  try{ d = await getJSON("/accounts/credits/usage"); }catch(e){ d = null; }
+  const hint = document.getElementById("creditUsageHint");
+  if(!d || !d.accounts || !d.accounts.length){
+    box.innerHTML = '<div class="stat-empty">还没有可用的账号</div>';
+    if(hint) hint.textContent = "";
+    return;
+  }
+  const sig = JSON.stringify([d.total, d.peak, d.peak_date, (d.daily || []).length]);
+  if(hint) statSetText(hint, "（官方口径 · 累计 " + fmt(Math.round(d.total || 0)) + " 积分）");
+  if(sig === CREDIT_USAGE_SIG) return;   // 数据没变就不重建（issue #98 的老教训）
+  CREDIT_USAGE_SIG = sig;
+  const daily = d.daily || [];
+  const failed = (d.accounts || []).filter(a => a && a.ok === false);
+  if(!daily.length){
+    box.innerHTML = '<div class="stat-empty">官方返回的逐日消耗为空（该账号可能还没产生用量）</div>';
+    return;
+  }
+  const max = Math.max.apply(null, daily.map(x => x.value || 0)) || 1;
+  const first = new Date(daily[0].date + "T00:00:00");
+  const lead = (first.getDay() + 6) % 7;
+  const cells = [];
+  for(let i = 0; i < lead; i++) cells.push(null);
+  daily.forEach(x => cells.push(x));
+  const grid = cells.map(x => {
+    if(!x) return '<span class="heat-cell" style="opacity:0"></span>';
+    const ratio = (x.value || 0) / max;
+    const lvl = !x.value ? 0 : (ratio <= 0.25 ? 1 : ratio <= 0.5 ? 2 : ratio <= 0.75 ? 3 : 4);
+    const tip = esc(x.date) + " · " + (x.value ? (Math.round(x.value * 100) / 100 + " 积分") : "无消耗");
+    return '<span class="heat-cell" data-l="' + lvl + '" data-tip="' + tip + '"></span>';
+  }).join("");
+  const accRows = (d.accounts || []).map(a =>
+    '<tr><td>' + esc(a.nickname || a.uid || "") + '</td>'
+    + '<td style="text-align:center">' + esc(a.realm || "") + '</td>'
+    + '<td style="text-align:right">' + fmt(Math.round(a.total || 0)) + '</td>'
+    + '<td style="text-align:right">' + (a.peak ? fmt(Math.round(a.peak)) : "—") + '</td>'
+    + '<td style="color:var(--dim)">' + (a.ok ? esc(a.peak_date || "") : "查询失败：" + esc(a.error || "")) + '</td></tr>').join("");
+  box.innerHTML =
+    '<div class="stat-panel-sub" style="margin:0 0 8px">'
+      + "累计消耗 <b>" + fmt(Math.round(d.total || 0)) + "</b> 积分 · 单日峰值 <b>"
+      + fmt(Math.round(d.peak || 0)) + "</b> 积分"
+      + (d.peak_date ? ("（" + esc(d.peak_date) + "）") : "")
+      + (failed.length ? (" · <span style=\"color:var(--warn)\">" + failed.length + " 个账号查询失败</span>") : "")
+      + "</div>"
+    + '<div class="heat-wrap"><div class="heat-grid" style="margin-bottom:6px">' + grid + "</div></div>"
+    + '<div class="heat-legend"><span>积分</span><i data-l="0"></i><span>0</span>'
+    + '<i data-l="1"></i><i data-l="2"></i><i data-l="3"></i><i data-l="4"></i>'
+    + '<span style="margin-left:auto">官方逐日消耗（近 365 天），与上方 token 热力图口径不同</span></div>'
+    + '<div class="table-wrap" style="margin-top:10px"><table class="insight-table"><thead><tr>'
+    + '<th>账号</th><th style="text-align:center">区域</th>'
+    + '<th style="text-align:right">累计消耗</th><th style="text-align:right">单日峰值</th>'
+    + '<th>峰值日期 / 错误</th></tr></thead><tbody>' + accRows + "</tbody></table></div>";
+  const wrap = box.querySelector(".heat-wrap");
+  if(wrap) statBindTip(wrap);
+  box.querySelectorAll(".heat-legend i").forEach(el => {
+    el.style.background = ["var(--panel2)", "rgba(56,189,248,.22)",
+                           "rgba(56,189,248,.40)", "rgba(56,189,248,.62)",
+                           "rgba(56,189,248,.88)"][Number(el.dataset.l)] || "var(--panel2)";
+  });
+}
+        // 上次渲染的数据签名（issue #98：不变就不重绘）
 let INSIGHT_ANIMATE = true;   // 只有首屏与手动刷新播放数字滚动
 
 // 图标卡片的 SVG（内联，零依赖）
@@ -6194,6 +6268,7 @@ async function loadAnalytics(force){
     }
   }catch(e){ /* 样本取不到不影响主看板 */ }
   loadQuality();
+  try{ loadCreditUsage(!!force); }catch(e){ /* 官方积分消耗失败不影响主看板 */ }
 }
 
 function renderStats(d){
